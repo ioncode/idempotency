@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main, master ]
 
+permissions:
+  contents: write
+
 jobs:
   test:
     name: "Integration, Chaos & Mutation Testing"
@@ -22,6 +25,7 @@ jobs:
       - name: "Execute Mutation Testing"
         run: |
           go install github.com/ioncode/idempotency
+          export PATH=$PATH:$(go env GOPATH)/bin
           go-mutesting ./... || echo "Mutation testing uncovered logic gaps"
 
   benchmark:
@@ -52,5 +56,7 @@ jobs:
           tool: 'go'
           output-file-path: bench_output.txt
           fail-on-alert: true
-          comment-on-commit: true
+          save-data-file: true
+          auto-push: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          alert-threshold: '150%'

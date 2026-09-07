@@ -81,7 +81,7 @@ func NewMiddleware(repo Repository, log Logger, opts ...Option) func(next http.H
 		MaxCacheBodySize:       DefaultMaxCacheBody,
 		MaxRequestPayloadLimit: DefaultMaxRequestPayload,
 		CoalesceTimeout:        DefaultCoalesceTimeout,
-		Tracer:                 otel.Tracer("://github.com"),
+		Tracer:                 otel.Tracer("github.com/ioncode/idempotency"),
 	}
 
 	for _, opt := range opts {
@@ -89,7 +89,7 @@ func NewMiddleware(repo Repository, log Logger, opts ...Option) func(next http.H
 	}
 
 	var localCache sync.Map
-	cb := &circuitBreaker{state: "CLOSED"}
+	cb := NewCircuitBreaker()
 	bufferPool := &sync.Pool{New: func() interface{} { return bytes.NewBuffer(make([]byte, 0, 4096)) }}
 
 	go func() {

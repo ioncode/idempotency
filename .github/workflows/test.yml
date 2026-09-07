@@ -24,7 +24,7 @@ jobs:
         run: go test -v -race -timeout 10m ./...
       - name: "Execute Mutation Testing"
         run: |
-          go install github.com/zimmski/go-mutesting@latest
+          go install github.com/zimmski/go-mutesting/cmd/go-mutesting@latest
           export PATH=$PATH:$(go env GOPATH)/bin
           go-mutesting ./... || echo "Mutation testing uncovered logic gaps"
 

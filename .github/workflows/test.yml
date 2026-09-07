@@ -21,7 +21,7 @@ jobs:
         run: go test -v -race -timeout 10m ./...
       - name: "Execute Mutation Testing"
         run: |
-          go install ://github.com
+          go install github.com/ioncode/idempotency
           go-mutesting ./... || echo "Mutation testing uncovered logic gaps"
 
   benchmark:

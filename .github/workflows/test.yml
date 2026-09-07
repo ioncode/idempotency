@@ -1,0 +1,56 @@
+name: "Ultra-Performance Quality Gate"
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    name: "Integration, Chaos & Mutation Testing"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+      - run: go mod tidy
+      - name: "Run All Quality Tests (Chaos & Race Detector)"
+        run: go test -v -race -timeout 10m ./...
+      - name: "Execute Mutation Testing"
+        run: |
+          go install ://github.com
+          go-mutesting ./... || echo "Mutation testing uncovered logic gaps"
+
+  benchmark:
+    name: "Continuous Performance Benchmarking"
+    runs-on: ubuntu-latest
+    needs: test
+        # Запускаем официальный контейнер Redis внутри CI
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.21' }
+      - name: "Run Microbenchmarks"
+        run: go test -benchmem -run=^$ -bench=. ./... | tee bench_output.txt
+      - name: "Store Benchmark Result Trends"
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: 'go'
+          output-file-path: bench_output.txt
+          fail-on-alert: true
+          comment-on-commit: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}

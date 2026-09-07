@@ -12,24 +12,32 @@ import (
 )
 
 // Инкапсулируем Lua-скрипты на уровне пакета через redis.NewScript для поддержки EVALSHA.
+// Атомарное выполнение гарантирует защиту отRace Conditions (состояний гонки данных).
 var (
+	// evaluateIdempotencyScript совмещает в себе фазы атомарной проверки лока и кэша.
+	// KEYS[1] - ключ распределенной блокировки (lock)
+	// KEYS[2] - ключ хэш-карты с кэшированными данными HTTP-ответа (data)
+	// ARGV[1] - SHA-256 хэш (цифровой отпечаток) тела запроса
+	// ARGV[2] - время жизни блокировки (TTL) в миллисекундах
 	evaluateIdempotencyScript = redis.NewScript(`
-		if redis.call("EXISTS", KEYS) == 1 then
+		if redis.call("EXISTS", KEYS[1]) == 1 then
 			return {"LOCKED", ""}
 		end
 		
-		local data = redis.call("HGETALL", KEYS)
+		local data = redis.call("HGETALL", KEYS[2])
 		if #data > 0 then
-			return {"HIT", data}
+			return {"HIT", "FOUND"}
 		end
 		
-		redis.call("SET", KEYS, ARGV, "PX", ARGV)
+		redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2])
 		return {"MISS", ""}
 	`)
 
+	// extendLockScript атомарно продлевает блокировку во время работы долгой бизнес-логики,
+	// проверяя, что текущий поток выполнения по-прежнему является владельцем этого замка.
 	extendLockScript = redis.NewScript(`
-		if redis.call("get", KEYS) == ARGV then
-			return redis.call("pexpire", KEYS, ARGV)
+		if redis.call("get", KEYS[1]) == ARGV[1] then
+			return redis.call("pexpire", KEYS[1], ARGV[2])
 		else
 			return 0
 		end
@@ -45,7 +53,8 @@ func NewRedisRepository(rdb *redis.Client) Repository {
 	return &redisRepository{rdb: rdb}
 }
 
-// EvaluateIdempotency совмещает TryLock и Get в едином атомарном Lua-скрипте на стороне Redis по протоколу EVALSHA.
+// EvaluateIdempotency осуществляет атомарную валидацию контракта идемпотентности за один сетевой запрос.
+// Использует go-redis метод StringSlice() для гарантированного безопасного разбора Lua-массивов без рантайм-паник.
 func (r *redisRepository) EvaluateIdempotency(ctx context.Context, key string, payloadHash string, ttl time.Duration) (string, *IdempotentRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return "", nil, err
@@ -54,23 +63,26 @@ func (r *redisRepository) EvaluateIdempotency(ctx context.Context, key string, p
 	lockKey := "lock:idempotency:" + key
 	dataKey := "data:idempotency:" + key
 
-	res, err := evaluateIdempotencyScript.Run(ctx, r.rdb, []string{lockKey, dataKey}, payloadHash, int64(ttl/time.Millisecond)).Result()
+	// Выполняем скрипт через EVALSHA. Драйвер сам загрузит скрипт в кэш Redis при первом вызове.
+	res, err := evaluateIdempotencyScript.Run(ctx, r.rdb, []string{lockKey, dataKey}, payloadHash, int64(ttl/time.Millisecond)).StringSlice()
 	if err != nil {
 		return "", nil, err
 	}
 
-	slice, ok := res.([]interface{})
-	if !ok || len(slice) < 2 {
+	if len(res) < 1 {
 		return "MISS", nil, nil
 	}
 
-	status := slice[0].(string)
+	status := res[0]
 
 	if status == "HIT" {
-		rawData := slice[1].([]interface{})
-		dataMap := make(map[string]string)
-		for i := 0; i < len(rawData); i += 2 {
-			dataMap[rawData[i].(string)] = rawData[i+1].(string)
+		// Если зафиксирован HIT, атомарно вычитываем хэш-карту ответа стандартной командой HGetAll
+		dataMap, err := r.rdb.HGetAll(ctx, dataKey).Result()
+		if err != nil {
+			return "", nil, err
+		}
+		if len(dataMap) == 0 {
+			return "MISS", nil, nil
 		}
 
 		var headers map[string][]string
@@ -97,22 +109,27 @@ func (r *redisRepository) EvaluateIdempotency(ctx context.Context, key string, p
 	return status, nil, nil
 }
 
-// ExtendLock атомарно продлевает блокировку через Lua-скрипт, проверяя владельца ключа.
+// ExtendLock продлевает блокировку в Redis, защищая долгие транзакции от перехвата по таймауту.
 func (r *redisRepository) ExtendLock(ctx context.Context, key string, payloadHash string, ttl time.Duration) (bool, error) {
 	lockKey := "lock:idempotency:" + key
 	res, err := extendLockScript.Run(ctx, r.rdb, []string{lockKey}, payloadHash, int64(ttl/time.Millisecond)).Result()
 	if err != nil {
 		return false, err
 	}
-	return res.(int64) == 1, nil
+
+	val, ok := res.(int64)
+	if !ok {
+		return false, nil
+	}
+	return val == 1, nil
 }
 
-// Unlock удаляет замок из Redis.
+// Unlock удаляет ключ распределенной блокировки из Redis.
 func (r *redisRepository) Unlock(ctx context.Context, key string) error {
 	return r.rdb.Del(context.Background(), "lock:idempotency:"+key).Err()
 }
 
-// Save персистирует сериализованный HTTP-ответ в Redis в виде хэш-таблицы.
+// Save сохраняет сериализованный успешный HTTP-ответ в Redis в виде хэш-карты с ограничением по времени (TTL).
 func (r *redisRepository) Save(ctx context.Context, record *IdempotentRecord, ttl time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -137,7 +154,8 @@ func (r *redisRepository) Save(ctx context.Context, record *IdempotentRecord, tt
 	return r.rdb.Expire(ctx, dataKey, ttl).Err()
 }
 
-// ProductionResponseWriter осуществляет проксирование ответов без лишних аллокаций памяти.
+// ProductionResponseWriter расширяет http.ResponseWriter, перехватывая поток байт ответа
+// и защищая оперативную память сервера от утечек (OOM) при обработке тяжелых payloads.
 type ProductionResponseWriter struct {
 	headers     http.Header
 	Body        *bytes.Buffer
@@ -146,11 +164,23 @@ type ProductionResponseWriter struct {
 	TooLarge    bool
 }
 
+// NewProductionResponseWriter инициализирует легковесный продакшен-враппер ответа.
 func NewProductionResponseWriter(buf *bytes.Buffer, maxSize int) *ProductionResponseWriter {
-	return &ProductionResponseWriter{headers: make(http.Header), Body: buf, StatusCode: http.StatusOK, MaxBodySize: maxSize}
+	return &ProductionResponseWriter{
+		headers:     make(http.Header),
+		Body:        buf,
+		StatusCode:  http.StatusOK,
+		MaxBodySize: maxSize,
+	}
 }
-func (w *ProductionResponseWriter) Header() http.Header        { return w.headers }
+
+// Header возвращает внутреннюю карту HTTP-заголовков.
+func (w *ProductionResponseWriter) Header() http.Header { return w.headers }
+
+// WriteHeader фиксирует HTTP-код ответа бизнес-логики.
 func (w *ProductionResponseWriter) WriteHeader(statusCode int) { w.StatusCode = statusCode }
+
+// Write буферизирует байты ответа. При превышении MaxBodySize память мгновенно сбрасывается через Reset().
 func (w *ProductionResponseWriter) Write(b []byte) (int, error) {
 	if w.TooLarge {
 		return len(b), nil

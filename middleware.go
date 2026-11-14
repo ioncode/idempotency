@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -92,7 +93,9 @@ func WithFailureStrategy(strategy FailureStrategy) Option {
 }
 
 func DefaultHeaderExtractor(headerName string) KeyExtractor {
-	return func(r *http.Request) string { return r.Header.Get(headerName) }
+	return func(r *http.Request) string {
+		return strings.Trim(r.Header.Get(headerName), "\"")
+	}
 }
 
 // NewMiddleware возвращает Chi-совместимый middleware дедупликации HTTP-запросов.
@@ -198,7 +201,9 @@ func NewMiddleware(repo Repository, log Logger, opts ...Option) func(next http.H
 				}
 
 				if time.Since(startTime) > coalesceTimeout {
-					w.Header().Set("Retry-After", "2")
+					if cfg.RetryAfter > 0 {
+						w.Header().Set("Retry-After", strconv.Itoa(max(1, int(cfg.RetryAfter.Seconds()))))
+					}
 					if cfg.ResponseStatusHeader != "" {
 						w.Header().Set(cfg.ResponseStatusHeader, StatusProcessing.String())
 					}

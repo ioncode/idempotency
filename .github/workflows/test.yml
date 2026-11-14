@@ -26,7 +26,7 @@ jobs:
         run: go test -v -race -tags=chaos -timeout 5m ./...
       - name: "Mutation Testing"
         run: |
-          go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@latest
+          GOTOOLCHAIN=auto go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@latest
           export PATH=$PATH:$(go env GOPATH)/bin
           go-mutesting github.com/ioncode/idempotency || echo "Mutation testing uncovered logic gaps"
 

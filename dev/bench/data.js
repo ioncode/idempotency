@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794651737541,
+  "lastUpdate": 1794652161841,
   "repoUrl": "https://github.com/ioncode/idempotency",
   "entries": {
     "Benchmark": [
@@ -488,6 +488,50 @@ window.BENCHMARK_DATA = {
             "value": 82,
             "unit": "allocs/op",
             "extra": "20241 times\n4 procs"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "ioncode",
+            "username": "ioncode"
+          },
+          "committer": {
+            "name": "ioncode",
+            "username": "ioncode"
+          },
+          "id": "0e0134d0813ec5581f9c3d3ba014476f1071088e",
+          "message": "fix lua scripts & chaos tests",
+          "timestamp": "2026-09-07T12:36:53Z",
+          "url": "https://github.com/ioncode/idempotency/pull/2/commits/0e0134d0813ec5581f9c3d3ba014476f1071088e"
+        },
+        "date": 1794652161377,
+        "tool": "go",
+        "benches": [
+          {
+            "name": "BenchmarkMiddleware_Processing",
+            "value": 56285,
+            "unit": "ns/op\t    9217 B/op\t      82 allocs/op",
+            "extra": "21405 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_Processing - ns/op",
+            "value": 56285,
+            "unit": "ns/op",
+            "extra": "21405 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_Processing - B/op",
+            "value": 9217,
+            "unit": "B/op",
+            "extra": "21405 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_Processing - allocs/op",
+            "value": 82,
+            "unit": "allocs/op",
+            "extra": "21405 times\n4 procs"
           }
         ]
       }

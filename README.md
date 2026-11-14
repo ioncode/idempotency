@@ -160,8 +160,8 @@ go test -v -race ./...
 go test -v -race -tags=chaos -timeout 5m ./...
 
 # 3. Запуск мутационного тестирования (проверка качества тестового покрытия)
-go install ://github.com
-go-mutesting ://github.com
+go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@latest
+go-mutesting github.com/ioncode/idempotency
 
 # 4. Запуск бенчмарков производительности с профилированием аллокаций памяти
 go test -benchmem -run=^\$ -bench=. ./...

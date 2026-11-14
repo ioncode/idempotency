@@ -104,7 +104,12 @@ func TestIdempotency_ChaosNetwork_CircuitBreaker(t *testing.T) {
 	defer rdb.Close()
 
 	repo := idempotency.NewRedisRepository(rdb)
-	middleware := idempotency.NewMiddleware(repo, logAdapter, idempotency.WithCoalesceTimeout(2*time.Second))
+	middleware := idempotency.NewMiddleware(
+		repo,
+		logAdapter,
+		idempotency.WithCoalesceTimeout(2*time.Second),
+		idempotency.WithCircuitBreakerCooldown(500*time.Millisecond),
+	)
 
 	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
@@ -154,27 +159,52 @@ func TestIdempotency_ChaosNetwork_CircuitBreaker(t *testing.T) {
 		assert.NoError(t, err)
 
 		// Делаем серию запросов для гарантированного переполнения счетчика сбоев
-		for i := 0; i < 5; i++ {
+		for i := range idempotency.DefaultCircuitBreakerThreshold {
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/payments", bytes.NewBuffer([]byte(`{}`)))
 			req.Header.Set("Idempotency-Key", fmt.Sprintf("chaos-trigger-key-%d", i))
 			rec := httptest.NewRecorder()
 			router.ServeHTTP(rec, req)
+
+			// Даже в момент сетевых таймаутов до размыкания цепи клиент получает 200 OK (Fail-Open)
+			assert.Equal(t, http.StatusOK, rec.Code)
+			assert.Equal(t, idempotency.StatusBypassFailOpen.String(), rec.Header().Get(idempotency.HeaderIdempotencyStat))
 		}
 
 		// ------------------------------------------------------------------
 		// ШАГ 3: ВЕРИФИКАЦИЯ РАЗОМКНУТОГО ПРЕДОХРАНИТЕЛЯ (OPEN)
 		// ------------------------------------------------------------------
 		// Предохранитель обязан быть в состоянии OPEN. Наш запрос пойдет по Fail-Open
+		startOpen := time.Now()
 		finalReq := httptest.NewRequest(http.MethodPost, "/api/v1/payments", bytes.NewBuffer([]byte(`{}`)))
 		finalReq.Header.Set("Idempotency-Key", "verified-open-key")
 		finalRec := httptest.NewRecorder()
 		router.ServeHTTP(finalRec, finalReq)
 
-		// Проверяем железобетонный контракт Fail-Open стратегии
+		// Проверяем железобетонный контракт Fail-Open стратегии и скорость отсечения
+		assert.Less(t, time.Since(startOpen), 100*time.Millisecond, "разомкнутый предохранитель не должен ждать таймаута Redis")
 		assert.Equal(t, idempotency.StatusBypassFailOpen.String(), finalRec.Header().Get(idempotency.HeaderIdempotencyStat))
 		assert.Equal(t, http.StatusOK, finalRec.Code)
 
-		// Восстанавливаем сеть
-		_ = proxy.RemoveToxic("latency_downstream")
+		// Восстанавливаем сеть для проверки цикла HALF_OPEN -> CLOSED
+		err = proxy.RemoveToxic("latency_downstream")
+		assert.NoError(t, err)
+
+		time.Sleep(600 * time.Millisecond)
+
+		recoverReq := httptest.NewRequest(http.MethodPost, "/api/v1/payments", bytes.NewBuffer([]byte(`{}`)))
+		recoverReq.Header.Set("Idempotency-Key", "verified-recovered-key")
+		recoverRec := httptest.NewRecorder()
+		router.ServeHTTP(recoverRec, recoverReq)
+
+		assert.Equal(t, idempotency.StatusMiss.String(), recoverRec.Header().Get(idempotency.HeaderIdempotencyStat))
+		assert.Equal(t, http.StatusOK, recoverRec.Code)
+
+		hitReq := httptest.NewRequest(http.MethodPost, "/api/v1/payments", bytes.NewBuffer([]byte(`{}`)))
+		hitReq.Header.Set("Idempotency-Key", "verified-recovered-key")
+		hitRec := httptest.NewRecorder()
+		router.ServeHTTP(hitRec, hitReq)
+
+		assert.Equal(t, idempotency.StatusHit.String(), hitRec.Header().Get(idempotency.HeaderIdempotencyStat))
+		assert.Equal(t, http.StatusOK, hitRec.Code)
 	})
 }

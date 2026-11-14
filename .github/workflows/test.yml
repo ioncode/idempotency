@@ -26,9 +26,9 @@ jobs:
         run: go test -v -race -tags=chaos -timeout 5m ./...
       - name: "Mutation Testing"
         run: |
-          go install github.com/zimmski/go-mutesting/cmd/go-mutesting@latest
+          go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@latest
           export PATH=$PATH:$(go env GOPATH)/bin
-          go-mutesting ./... || echo "Mutation testing uncovered logic gaps"
+          go-mutesting github.com/ioncode/idempotency || echo "Mutation testing uncovered logic gaps"
 
   benchmark:
     name: "Continuous Performance Benchmarking"

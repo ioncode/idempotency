@@ -1,10 +1,8 @@
 package idempotency
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"net/http"
 	"strconv"
 	"time"
 
@@ -152,44 +150,4 @@ func (r *redisRepository) Save(ctx context.Context, record *IdempotentRecord, tt
 		return err
 	}
 	return r.rdb.Expire(ctx, dataKey, ttl).Err()
-}
-
-// ProductionResponseWriter расширяет http.ResponseWriter, перехватывая поток байт ответа
-// и защищая оперативную память сервера от утечек (OOM) при обработке тяжелых payloads.
-type ProductionResponseWriter struct {
-	headers     http.Header
-	Body        *bytes.Buffer
-	StatusCode  int
-	MaxBodySize int
-	TooLarge    bool
-}
-
-// NewProductionResponseWriter инициализирует легковесный продакшен-враппер ответа.
-func NewProductionResponseWriter(buf *bytes.Buffer, maxSize int) *ProductionResponseWriter {
-	return &ProductionResponseWriter{
-		headers:     make(http.Header),
-		Body:        buf,
-		StatusCode:  http.StatusOK,
-		MaxBodySize: maxSize,
-	}
-}
-
-// Header возвращает внутреннюю карту HTTP-заголовков.
-func (w *ProductionResponseWriter) Header() http.Header { return w.headers }
-
-// WriteHeader фиксирует HTTP-код ответа бизнес-логики.
-func (w *ProductionResponseWriter) WriteHeader(statusCode int) { w.StatusCode = statusCode }
-
-// Write буферизирует байты ответа. При превышении MaxBodySize память мгновенно сбрасывается через Reset().
-func (w *ProductionResponseWriter) Write(b []byte) (int, error) {
-	if w.TooLarge {
-		return len(b), nil
-	}
-	if w.MaxBodySize > 0 && w.Body.Len()+len(b) > w.MaxBodySize {
-		w.TooLarge = true
-		w.Body.Reset()
-	} else {
-		w.Body.Write(b)
-	}
-	return len(b), nil
 }

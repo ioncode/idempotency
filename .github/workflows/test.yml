@@ -3,30 +3,37 @@ name: "Ultra-Performance Quality Gate"
 on:
   push:
     branches: [ main, master ]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/**'
   pull_request:
     branches: [ main, master ]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/**'
 
 permissions:
   contents: write
 
 jobs:
   test:
-    name: "Integration, Chaos & Mutation Testing"
+    name: "Unit, Race & Chaos Testing"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: '1.21'
+          go-version-file: 'go.mod'
           cache: true
-      - run: go mod tidy
-      - name: "Run All Quality Tests (Chaos & Race Detector)"
-        run: go test -v -race -timeout 10m ./...
-      - name: "Execute Mutation Testing"
-        run: |
-          go install github.com/zimmski/go-mutesting/cmd/go-mutesting@latest
-          export PATH=$PATH:$(go env GOPATH)/bin
-          go-mutesting ./... || echo "Mutation testing uncovered logic gaps"
+      - name: "Run Unit & Race Tests"
+        run: go test -v -race ./...
+
+      - name: "Run Chaos Network Tests"
+        run: go test -v -race -tags=chaos -timeout 5m ./...
 
   benchmark:
     name: "Continuous Performance Benchmarking"
@@ -45,9 +52,11 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: '1.21' }
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
       - name: "Run Microbenchmarks"
         run: go test -benchmem -run=^$ -bench=. ./... | tee bench_output.txt
       - name: "Store Benchmark Result Trends"

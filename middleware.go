@@ -3,7 +3,9 @@ package idempotency
 import (
 	"bytes"
 	"errors"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,9 +24,9 @@ const (
 	DefaultCoalesceTimeout   = 3 * time.Second
 	DefaultCoalesceInterval  = 150 * time.Millisecond
 	DefaultMaxRequestPayload = 10 * 1024 * 1024
-
-	HeaderOriginalDate    = "Original-Request-Date"
-	HeaderIdempotencyStat = "X-Idempotency-Status"
+	DefaultRetryAfter        = 2 * time.Second
+	HeaderOriginalDate       = "Original-Request-Date"
+	HeaderIdempotencyStat    = "X-Idempotency-Status"
 )
 
 var hopByHopHeaders = map[string]bool{
@@ -34,21 +36,26 @@ var hopByHopHeaders = map[string]bool{
 }
 
 type Config struct {
-	KeyExtractor           KeyExtractor
-	ResponseStatusHeader   string
-	LockTTL                time.Duration
-	ResponseTTL            time.Duration
-	MaxCacheBodySize       int
-	MaxRequestPayloadLimit int64
-	CoalesceTimeout        time.Duration
-	Tracer                 trace.Tracer
+	KeyExtractor            KeyExtractor
+	ResponseStatusHeader    string
+	LockTTL                 time.Duration
+	ResponseTTL             time.Duration
+	MaxCacheBodySize        int
+	MaxRequestPayloadLimit  int64
+	CoalesceTimeout         time.Duration
+	Tracer                  trace.Tracer
+	RetryAfter              time.Duration
+	CircuitBreakerThreshold int
+	CircuitBreakerCooldown  time.Duration
+	FailureStrategy         FailureStrategy
 }
 
-// inMemoryItem описывает элемент локального L1-кэша в оперативной памяти.
-type inMemoryItem struct {
-	payloadHash string
-	expiresAt   time.Time
-}
+type FailureStrategy int
+
+const (
+	FailOpen FailureStrategy = iota
+	FailClosed
+)
 
 type Option func(*Config)
 
@@ -66,9 +73,26 @@ func WithMaxRequestPayloadLimit(bytes int64) Option {
 }
 func WithCoalesceTimeout(d time.Duration) Option { return func(c *Config) { c.CoalesceTimeout = d } }
 func WithTracer(t trace.Tracer) Option           { return func(c *Config) { c.Tracer = t } }
+func WithRetryAfter(d time.Duration) Option {
+	return func(c *Config) { c.RetryAfter = d }
+}
+
+func WithCircuitBreakerThreshold(threshold int) Option {
+	return func(c *Config) { c.CircuitBreakerThreshold = threshold }
+}
+
+func WithCircuitBreakerCooldown(cooldown time.Duration) Option {
+	return func(c *Config) { c.CircuitBreakerCooldown = cooldown }
+}
+
+func WithFailureStrategy(strategy FailureStrategy) Option {
+	return func(c *Config) { c.FailureStrategy = strategy }
+}
 
 func DefaultHeaderExtractor(headerName string) KeyExtractor {
-	return func(r *http.Request) string { return r.Header.Get(headerName) }
+	return func(r *http.Request) string {
+		return strings.Trim(r.Header.Get(headerName), "\"")
+	}
 }
 
 // NewMiddleware возвращает Chi-совместимый middleware дедупликации HTTP-запросов.
@@ -81,28 +105,14 @@ func NewMiddleware(repo Repository, log Logger, opts ...Option) func(next http.H
 		MaxCacheBodySize:       DefaultMaxCacheBody,
 		MaxRequestPayloadLimit: DefaultMaxRequestPayload,
 		CoalesceTimeout:        DefaultCoalesceTimeout,
-		Tracer:                 otel.Tracer("://github.com"),
+		Tracer:                 otel.Tracer("github.com/ioncode/idempotency"),
 	}
 
 	for _, opt := range opts {
 		opt(cfg)
 	}
-
-	var localCache sync.Map
-	cb := &circuitBreaker{state: "CLOSED"}
+	cb := NewCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerCooldown)
 	bufferPool := &sync.Pool{New: func() interface{} { return bytes.NewBuffer(make([]byte, 0, 4096)) }}
-
-	go func() {
-		for {
-			time.Sleep(1 * time.Minute)
-			localCache.Range(func(key, value interface{}) bool {
-				if item, ok := value.(inMemoryItem); ok && time.Now().After(item.expiresAt) {
-					localCache.Delete(key)
-				}
-				return true
-			})
-		}
-	}()
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -188,7 +198,9 @@ func NewMiddleware(repo Repository, log Logger, opts ...Option) func(next http.H
 				}
 
 				if time.Since(startTime) > coalesceTimeout {
-					w.Header().Set("Retry-After", "2")
+					if cfg.RetryAfter > 0 {
+						w.Header().Set("Retry-After", strconv.Itoa(max(1, int(cfg.RetryAfter.Seconds()))))
+					}
 					if cfg.ResponseStatusHeader != "" {
 						w.Header().Set(cfg.ResponseStatusHeader, StatusProcessing.String())
 					}
@@ -206,17 +218,18 @@ func NewMiddleware(repo Repository, log Logger, opts ...Option) func(next http.H
 			}
 
 			if record != nil {
-				if val, ok := localCache.Load(idempotencyKey); ok {
-					if item, ok := val.(inMemoryItem); ok && time.Now().Before(item.expiresAt) {
-						if record.PayloadHash != "" && item.payloadHash != "" && record.PayloadHash != item.payloadHash {
-							if cfg.ResponseStatusHeader != "" {
-								w.Header().Set(cfg.ResponseStatusHeader, StatusConflict.String())
-							}
-							globalMetrics.IncRequests(StatusConflict, requestPath)
-							span.SetAttributes(attribute.String("idempotency.status", StatusConflict.String()))
-							http.Error(w, "Idempotency Key payload mismatch", http.StatusConflict)
-							return
+				if record.PayloadHash != "" {
+					_, _ = io.Copy(io.Discard, hashReader)
+					incomingHash := hashReader.Sum()
+
+					if hashReader.TooLarge || incomingHash != record.PayloadHash {
+						if cfg.ResponseStatusHeader != "" {
+							w.Header().Set(cfg.ResponseStatusHeader, StatusConflict.String())
 						}
+						globalMetrics.IncRequests(StatusConflict, requestPath)
+						span.SetAttributes(attribute.String("idempotency.status", StatusConflict.String()))
+						http.Error(w, "Idempotency Key payload mismatch", http.StatusConflict)
+						return
 					}
 				}
 
@@ -263,7 +276,7 @@ func NewMiddleware(repo Repository, log Logger, opts ...Option) func(next http.H
 			buf.Reset()
 			defer bufferPool.Put(buf)
 
-			crw := NewProductionResponseWriter(buf, cfg.MaxCacheBodySize)
+			crw := NewProductionResponseWriter(w, buf, cfg.MaxCacheBodySize, cfg.ResponseStatusHeader)
 			statusTag := StatusMiss
 			if !isRedisAvailable {
 				statusTag = StatusBypassFailOpen
@@ -278,7 +291,7 @@ func NewMiddleware(repo Repository, log Logger, opts ...Option) func(next http.H
 
 			if isRedisAvailable && crw.StatusCode < 500 && statusTag == StatusMiss && ctx.Err() == nil {
 				rawHeaders := crw.Header()
-				filteredHeaders := make(map[string][]string)
+				filteredHeaders := make(map[string][]string, len(rawHeaders))
 				for key, values := range rawHeaders {
 					if hopByHopHeaders[strings.ToLower(key)] {
 						continue
@@ -297,26 +310,10 @@ func NewMiddleware(repo Repository, log Logger, opts ...Option) func(next http.H
 
 				saveErr := repo.Save(ctx, savedRecord, cfg.ResponseTTL)
 				cb.RecordResult(saveErr)
-
-				if saveErr == nil {
-					localCache.Store(idempotencyKey, inMemoryItem{
-						payloadHash: computedHash,
-						expiresAt:   time.Now().Add(5 * time.Second),
-					})
-				}
 			}
 
-			if cfg.ResponseStatusHeader != "" {
-				w.Header().Set(cfg.ResponseStatusHeader, statusTag.String())
-			}
-			for key, values := range crw.Header() {
-				for _, value := range values {
-					w.Header().Add(key, value)
-				}
-			}
 			span.SetAttributes(attribute.String("idempotency.status", statusTag.String()))
-			w.WriteHeader(crw.StatusCode)
-			_, _ = w.Write(crw.Body.Bytes())
+			crw.Commit(statusTag.String())
 		})
 	}
 }

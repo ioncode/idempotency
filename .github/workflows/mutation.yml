@@ -1,0 +1,38 @@
+name: "Mutation Testing"
+
+on:
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+jobs:
+  mutation:
+    name: "Mutate (${{ matrix.target }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - breaker.go
+          - writer.go
+          - reader.go metrics.go
+          - middleware.go
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: "Install go-mutesting"
+        run: GOTOOLCHAIN=auto go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@latest
+
+      - name: "Execute Mutation Testing"
+        run: |
+          export PATH=$PATH:$(go env GOPATH)/bin
+          go-mutesting ${{ matrix.target }} || echo "Mutation testing uncovered logic gaps"

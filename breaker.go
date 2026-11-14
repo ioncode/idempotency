@@ -16,6 +16,13 @@ const (
 	StateHalfOpen = "HALF_OPEN"
 )
 
+const (
+	// DefaultCircuitBreakerThreshold — количество последовательных сбоев Redis, после которого цепь размыкается.
+	DefaultCircuitBreakerThreshold = 5
+	// DefaultCircuitBreakerCooldown — время охлаждения, после которого предохранитель переходит в Half-Open.
+	DefaultCircuitBreakerCooldown = 30 * time.Second
+)
+
 // circuitBreaker реализует конечный автомат защиты Go-процесса от сетевых деградаций Redis.
 type circuitBreaker struct {
 	mu               sync.RWMutex

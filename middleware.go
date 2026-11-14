@@ -17,19 +17,16 @@ import (
 )
 
 const (
-	DefaultHeaderName              = "Idempotency-Key"
-	DefaultLockTTL                 = 10 * time.Second
-	DefaultResponseTTL             = 24 * time.Hour
-	DefaultMaxCacheBody            = 2 * 1024 * 1024
-	DefaultCoalesceTimeout         = 3 * time.Second
-	DefaultCoalesceInterval        = 150 * time.Millisecond
-	DefaultMaxRequestPayload       = 10 * 1024 * 1024
-	DefaultRetryAfter              = 2 * time.Second
-	DefaultCircuitBreakerThreshold = 5
-	DefaultCircuitBreakerCooldown  = 30 * time.Second
-
-	HeaderOriginalDate    = "Original-Request-Date"
-	HeaderIdempotencyStat = "X-Idempotency-Status"
+	DefaultHeaderName        = "Idempotency-Key"
+	DefaultLockTTL           = 10 * time.Second
+	DefaultResponseTTL       = 24 * time.Hour
+	DefaultMaxCacheBody      = 2 * 1024 * 1024
+	DefaultCoalesceTimeout   = 3 * time.Second
+	DefaultCoalesceInterval  = 150 * time.Millisecond
+	DefaultMaxRequestPayload = 10 * 1024 * 1024
+	DefaultRetryAfter        = 2 * time.Second
+	HeaderOriginalDate       = "Original-Request-Date"
+	HeaderIdempotencyStat    = "X-Idempotency-Status"
 )
 
 var hopByHopHeaders = map[string]bool{

@@ -1,3 +1,5 @@
+//go:build chaos
+
 package idempotency_test
 
 import (

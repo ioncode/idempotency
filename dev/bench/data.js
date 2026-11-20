@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794653616554,
+  "lastUpdate": 1795168782666,
   "repoUrl": "https://github.com/ioncode/idempotency",
   "entries": {
     "Benchmark": [
@@ -712,6 +712,50 @@ window.BENCHMARK_DATA = {
             "value": 82,
             "unit": "allocs/op",
             "extra": "19791 times\n4 procs"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "ioncode",
+            "username": "ioncode"
+          },
+          "committer": {
+            "name": "ioncode",
+            "username": "ioncode"
+          },
+          "id": "b0decd389ff00b0701288ef72e464e6bcca898d6",
+          "message": "atomic redis save via pipeline",
+          "timestamp": "2026-09-07T12:36:53Z",
+          "url": "https://github.com/ioncode/idempotency/pull/3/commits/b0decd389ff00b0701288ef72e464e6bcca898d6"
+        },
+        "date": 1795168782083,
+        "tool": "go",
+        "benches": [
+          {
+            "name": "BenchmarkMiddleware_Processing",
+            "value": 69960,
+            "unit": "ns/op\t    9220 B/op\t      82 allocs/op",
+            "extra": "17607 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_Processing - ns/op",
+            "value": 69960,
+            "unit": "ns/op",
+            "extra": "17607 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_Processing - B/op",
+            "value": 9220,
+            "unit": "B/op",
+            "extra": "17607 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_Processing - allocs/op",
+            "value": 82,
+            "unit": "allocs/op",
+            "extra": "17607 times\n4 procs"
           }
         ]
       }

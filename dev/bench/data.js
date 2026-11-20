@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795168782666,
+  "lastUpdate": 1795169119430,
   "repoUrl": "https://github.com/ioncode/idempotency",
   "entries": {
     "Benchmark": [
@@ -756,6 +756,54 @@ window.BENCHMARK_DATA = {
             "value": 82,
             "unit": "allocs/op",
             "extra": "17607 times\n4 procs"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "ionrussia@gmail.com",
+            "name": "Andrey Ponteleev",
+            "username": "ioncode"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8d11dac5ccca915dd1d3d458ad2f9257ae16ea4c",
+          "message": "Merge pull request #3 from ioncode/dev\n\natomic redis save via pipeline",
+          "timestamp": "2026-11-20T13:03:11+03:00",
+          "tree_id": "c470f3d8526ca587dcb6cd0a25a8e91b5d8b1565",
+          "url": "https://github.com/ioncode/idempotency/commit/8d11dac5ccca915dd1d3d458ad2f9257ae16ea4c"
+        },
+        "date": 1795169118504,
+        "tool": "go",
+        "benches": [
+          {
+            "name": "BenchmarkMiddleware_Processing",
+            "value": 82478,
+            "unit": "ns/op\t    9224 B/op\t      82 allocs/op",
+            "extra": "14803 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_Processing - ns/op",
+            "value": 82478,
+            "unit": "ns/op",
+            "extra": "14803 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_Processing - B/op",
+            "value": 9224,
+            "unit": "B/op",
+            "extra": "14803 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_Processing - allocs/op",
+            "value": 82,
+            "unit": "allocs/op",
+            "extra": "14803 times\n4 procs"
           }
         ]
       }

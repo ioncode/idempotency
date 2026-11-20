@@ -127,27 +127,29 @@ func (r *redisRepository) Unlock(ctx context.Context, key string) error {
 	return r.rdb.Del(context.Background(), "lock:idempotency:"+key).Err()
 }
 
-// Save сохраняет сериализованный успешный HTTP-ответ в Redis в виде хэш-карты с ограничением по времени (TTL).
+// Save атомарно сохраняет сериализованный успешный HTTP-ответ в Redis
+// в виде хэш-карты и устанавливает время жизни (TTL) за один сетевой вызов.
 func (r *redisRepository) Save(ctx context.Context, record *IdempotentRecord, ttl time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	dataKey := "data:idempotency:" + record.Key
 
+	dataKey := "data:idempotency:" + record.Key
 	headersJSON, err := json.Marshal(record.ResponseHeaders)
 	if err != nil {
 		return err
 	}
 
-	err = r.rdb.HSet(ctx, dataKey, map[string]interface{}{
+	pipe := r.rdb.TxPipeline()
+	pipe.HSet(ctx, dataKey, map[string]interface{}{
 		"body":       string(record.ResponseBody),
 		"hash":       record.PayloadHash,
 		"status":     strconv.Itoa(record.StatusCode),
 		"headers":    string(headersJSON),
 		"created_at": record.CreatedAt.Unix(),
-	}).Err()
-	if err != nil {
-		return err
-	}
-	return r.rdb.Expire(ctx, dataKey, ttl).Err()
+	})
+	pipe.PExpire(ctx, dataKey, ttl)
+
+	_, err = pipe.Exec(ctx)
+	return err
 }

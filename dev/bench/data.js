@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795169119430,
+  "lastUpdate": 1795430535015,
   "repoUrl": "https://github.com/ioncode/idempotency",
   "entries": {
     "Benchmark": [
@@ -804,6 +804,74 @@ window.BENCHMARK_DATA = {
             "value": 82,
             "unit": "allocs/op",
             "extra": "14803 times\n4 procs"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "ioncode",
+            "username": "ioncode"
+          },
+          "committer": {
+            "name": "ioncode",
+            "username": "ioncode"
+          },
+          "id": "90c6735073c99bec39d24f7865efad695e97911b",
+          "message": "Dev",
+          "timestamp": "2026-09-07T12:36:53Z",
+          "url": "https://github.com/ioncode/idempotency/pull/4/commits/90c6735073c99bec39d24f7865efad695e97911b"
+        },
+        "date": 1795430534388,
+        "tool": "go",
+        "benches": [
+          {
+            "name": "BenchmarkMiddleware_CacheHit",
+            "value": 4269,
+            "unit": "ns/op\t    7760 B/op\t      41 allocs/op",
+            "extra": "253773 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheHit - ns/op",
+            "value": 4269,
+            "unit": "ns/op",
+            "extra": "253773 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheHit - B/op",
+            "value": 7760,
+            "unit": "B/op",
+            "extra": "253773 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheHit - allocs/op",
+            "value": 41,
+            "unit": "allocs/op",
+            "extra": "253773 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheMiss",
+            "value": 9926,
+            "unit": "ns/op\t    9140 B/op\t      56 allocs/op",
+            "extra": "111838 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheMiss - ns/op",
+            "value": 9926,
+            "unit": "ns/op",
+            "extra": "111838 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheMiss - B/op",
+            "value": 9140,
+            "unit": "B/op",
+            "extra": "111838 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheMiss - allocs/op",
+            "value": 56,
+            "unit": "allocs/op",
+            "extra": "111838 times\n4 procs"
           }
         ]
       }

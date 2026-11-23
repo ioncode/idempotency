@@ -39,8 +39,13 @@ func (w *ProductionResponseWriter) Header() http.Header {
 	return w.w.Header()
 }
 
-// WriteHeader сохраняет статус-код, игнорируя повторные вызовы.
+// WriteHeader сохраняет финальный статус-код ответа, пробрасывая 1xx-информационные
+// статусы напрямую и игнорируя повторные вызовы.
 func (w *ProductionResponseWriter) WriteHeader(statusCode int) {
+	if statusCode >= 100 && statusCode < 200 && statusCode != http.StatusSwitchingProtocols {
+		w.w.WriteHeader(statusCode)
+		return
+	}
 	if w.headerFlushed || w.wroteHeader {
 		return
 	}
@@ -58,16 +63,18 @@ func (w *ProductionResponseWriter) Write(b []byte) (int, error) {
 
 	if w.MaxBodySize > 0 && w.Body.Len()+len(b) > w.MaxBodySize {
 		w.TooLarge = true
-		w.flushToStream(StatusBypassTooLarge.String())
+		if err := w.flush(StatusBypassTooLarge.String(), true); err != nil {
+			return 0, err
+		}
 		return w.w.Write(b)
 	}
 
 	return w.Body.Write(b)
 }
 
-func (w *ProductionResponseWriter) flushToStream(statusValue string) {
+func (w *ProductionResponseWriter) flush(statusValue string, reset bool) error {
 	if w.headerFlushed {
-		return
+		return nil
 	}
 	if w.statusHeader != "" && statusValue != "" {
 		w.w.Header().Set(w.statusHeader, statusValue)
@@ -76,34 +83,26 @@ func (w *ProductionResponseWriter) flushToStream(statusValue string) {
 	w.headerFlushed = true
 
 	if w.Body.Len() > 0 {
-		_, _ = w.w.Write(w.Body.Bytes())
-		w.Body.Reset()
+		_, err := w.w.Write(w.Body.Bytes())
+		if reset {
+			w.Body.Reset()
+		}
+		return err
 	}
+	return nil
 }
 
 // Commit фиксирует ответ и отправляет накопленный буфер клиенту.
 func (w *ProductionResponseWriter) Commit(statusValue string) {
-	if w.headerFlushed {
-		return
-	}
-	if w.statusHeader != "" && statusValue != "" {
-		w.w.Header().Set(w.statusHeader, statusValue)
-	}
-	w.w.WriteHeader(w.StatusCode)
-	w.headerFlushed = true
-
-	if w.Body.Len() > 0 {
-		_, _ = w.w.Write(w.Body.Bytes())
-	}
+	_ = w.flush(statusValue, false)
 }
 
-// Flush переводит writer в потоковый режим и вызывает Flush у нижележащего хэндлера при его наличии.
+// Flush переводит writer в потоковый режим и сбрасывает буфер в нижележащий сокет
+// через http.ResponseController (поддерживает цепочки оберток через Unwrap).
 func (w *ProductionResponseWriter) Flush() {
 	if !w.headerFlushed {
 		w.TooLarge = true
-		w.flushToStream(StatusBypassTooLarge.String())
+		_ = w.flush(StatusBypassTooLarge.String(), true)
 	}
-	if f, ok := w.w.(http.Flusher); ok {
-		f.Flush()
-	}
+	_ = http.NewResponseController(w.w).Flush()
 }

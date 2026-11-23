@@ -240,9 +240,6 @@ func (m *middleware) handler(next http.Handler) http.Handler {
 							return
 						}
 					case <-ctx.Done():
-						unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
-						_ = m.locker.Unlock(unlockCtx, idempotencyKey, ownerToken)
-						cancel()
 						return
 					case <-stopRenewal:
 						return

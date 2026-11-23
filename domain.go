@@ -10,11 +10,6 @@ import (
 	"github.com/ioncode/ulog/v3"
 )
 
-const (
-	HeaderIdempotencyKey  = "Idempotency-Key"
-	HeaderIdempotencyStat = "X-Idempotency-Status"
-)
-
 type Status string
 
 const (

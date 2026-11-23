@@ -7,6 +7,17 @@ import (
 	"strings"
 )
 
+const (
+	// HeaderIdempotencyKey — стандартное имя HTTP-заголовка для передачи ключа идемпотентности (IETF draft).
+	HeaderIdempotencyKey = "Idempotency-Key"
+
+	// HeaderIdempotencyStat — стандартное имя диагностического HTTP-заголовка со статусом обработки запроса.
+	HeaderIdempotencyStat = "X-Idempotency-Status"
+
+	// HeaderOriginalDate — имя HTTP-заголовка с датой и временем первоначального выполнения транзакции (RFC 7231).
+	HeaderOriginalDate = "Original-Request-Date"
+)
+
 // hopByHopHeaders содержит список заголовков уровня соединения (RFC 7230),
 // а также транспортных заголовков, которые не должны сохраняться в кэш
 // и воспроизводиться при повторных запросах.

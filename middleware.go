@@ -2,101 +2,41 @@ package idempotency
 
 import (
 	"bytes"
-	"errors"
+	"context"
+	"crypto/rand"
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/ioncode/ulog"
+	"golang.org/x/sync/singleflight"
+
+	"github.com/ioncode/ulog/v3"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
-const (
-	DefaultHeaderName        = "Idempotency-Key"
-	DefaultLockTTL           = 10 * time.Second
-	DefaultResponseTTL       = 24 * time.Hour
-	DefaultMaxCacheBody      = 2 * 1024 * 1024
-	DefaultCoalesceTimeout   = 3 * time.Second
-	DefaultCoalesceInterval  = 150 * time.Millisecond
-	DefaultMaxRequestPayload = 10 * 1024 * 1024
-	DefaultRetryAfter        = 2 * time.Second
-	HeaderOriginalDate       = "Original-Request-Date"
-	HeaderIdempotencyStat    = "X-Idempotency-Status"
-)
-
-var hopByHopHeaders = map[string]bool{
-	"connection": true, "keep-alive": true, "proxy-authenticate": true,
-	"proxy-authorization": true, "te": true, "trailer": true, "transfer-encoding": true,
-	"upgrade": true, "content-length": true, "date": true, "server": true,
+// middleware инкапсулирует состояние и зависимости HTTP-перехватчика идемпотентности.
+type middleware struct {
+	locker     Locker
+	saver      Saver
+	log        Logger
+	cfg        *Config
+	cb         *CircuitBreaker
+	bufferPool *sync.Pool
+	sf         singleflight.Group
 }
 
-type Config struct {
-	KeyExtractor            KeyExtractor
-	ResponseStatusHeader    string
-	LockTTL                 time.Duration
-	ResponseTTL             time.Duration
-	MaxCacheBodySize        int
-	MaxRequestPayloadLimit  int64
-	CoalesceTimeout         time.Duration
-	Tracer                  trace.Tracer
-	RetryAfter              time.Duration
-	CircuitBreakerThreshold int
-	CircuitBreakerCooldown  time.Duration
-	FailureStrategy         FailureStrategy
-}
-
-type FailureStrategy int
-
-const (
-	FailOpen FailureStrategy = iota
-	FailClosed
-)
-
-type Option func(*Config)
-
-func WithKeyExtractor(extractor KeyExtractor) Option {
-	return func(c *Config) { c.KeyExtractor = extractor }
-}
-func WithResponseStatusHeader(headerName string) Option {
-	return func(c *Config) { c.ResponseStatusHeader = headerName }
-}
-func WithLockTTL(ttl time.Duration) Option     { return func(c *Config) { c.LockTTL = ttl } }
-func WithResponseTTL(ttl time.Duration) Option { return func(c *Config) { c.ResponseTTL = ttl } }
-func WithMaxCacheBodySize(bytes int) Option    { return func(c *Config) { c.MaxCacheBodySize = bytes } }
-func WithMaxRequestPayloadLimit(bytes int64) Option {
-	return func(c *Config) { c.MaxRequestPayloadLimit = bytes }
-}
-func WithCoalesceTimeout(d time.Duration) Option { return func(c *Config) { c.CoalesceTimeout = d } }
-func WithTracer(t trace.Tracer) Option           { return func(c *Config) { c.Tracer = t } }
-func WithRetryAfter(d time.Duration) Option {
-	return func(c *Config) { c.RetryAfter = d }
-}
-
-func WithCircuitBreakerThreshold(threshold int) Option {
-	return func(c *Config) { c.CircuitBreakerThreshold = threshold }
-}
-
-func WithCircuitBreakerCooldown(cooldown time.Duration) Option {
-	return func(c *Config) { c.CircuitBreakerCooldown = cooldown }
-}
-
-func WithFailureStrategy(strategy FailureStrategy) Option {
-	return func(c *Config) { c.FailureStrategy = strategy }
-}
-
-func DefaultHeaderExtractor(headerName string) KeyExtractor {
-	return func(r *http.Request) string {
-		return strings.Trim(r.Header.Get(headerName), "\"")
-	}
-}
-
-// NewMiddleware возвращает Chi-совместимый middleware дедупликации HTTP-запросов.
-func NewMiddleware(repo Repository, log Logger, opts ...Option) func(next http.Handler) http.Handler {
+// NewMiddleware возвращает Chi-совместимый HTTP middleware для дедупликации мутирующих запросов.
+//
+// Параметры:
+//   - locker: реализация распределенных блокировок для предотвращения гонок при параллельных запросах.
+//   - saver: хранилище для сохранения и последующего воспроизведения успешных HTTP-ответов.
+//   - log: структурированный логгер (ulog/v3); может быть nil для отключения логирования.
+//   - opts: функциональные опции для переопределения конфигурации по умолчанию.
+func NewMiddleware(locker Locker, saver Saver, log Logger, opts ...Option) func(next http.Handler) http.Handler {
 	cfg := &Config{
 		KeyExtractor:           DefaultHeaderExtractor(DefaultHeaderName),
 		ResponseStatusHeader:   HeaderIdempotencyStat,
@@ -105,221 +45,268 @@ func NewMiddleware(repo Repository, log Logger, opts ...Option) func(next http.H
 		MaxCacheBodySize:       DefaultMaxCacheBody,
 		MaxRequestPayloadLimit: DefaultMaxRequestPayload,
 		CoalesceTimeout:        DefaultCoalesceTimeout,
+		CoalesceInterval:       DefaultCoalesceInterval,
 		Tracer:                 otel.Tracer("github.com/ioncode/idempotency"),
+		RetryAfter:             DefaultRetryAfter,
+		ConflictStatusCode:     http.StatusUnprocessableEntity,
 	}
 
 	for _, opt := range opts {
-		opt(cfg)
+		if opt != nil {
+			opt(cfg)
+		}
 	}
-	cb := NewCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerCooldown)
-	bufferPool := &sync.Pool{New: func() interface{} { return bytes.NewBuffer(make([]byte, 0, 4096)) }}
 
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Method != http.MethodPost && r.Method != http.MethodPatch && r.Method != http.MethodPut {
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			requestPath := r.URL.Path
-			traceID := ulog.GetTraceID(r.Context())
-			idempotencyKey := cfg.KeyExtractor(r)
-
-			if idempotencyKey == "" {
-				http.Error(w, "Idempotency key is missing", http.StatusBadRequest)
-				return
-			}
-
-			ctx, span := cfg.Tracer.Start(r.Context(), "idempotency.middleware",
-				trace.WithSpanKind(trace.SpanKindInternal),
-				trace.WithAttributes(
-					attribute.String("idempotency.key", idempotencyKey),
-					attribute.String("idempotency.path", requestPath),
-					attribute.String("ulog.trace_id", traceID),
-				),
-			)
-			defer span.End()
-
-			cb.mu.RLock()
-			cbState := cb.state
-			cb.mu.RUnlock()
-			span.SetAttributes(attribute.String("circuit_breaker.state", cbState))
-
-			if !cb.Allow() {
-				if cfg.ResponseStatusHeader != "" {
-					w.Header().Set(cfg.ResponseStatusHeader, StatusBypassFailOpen.String())
-				}
-				globalMetrics.IncRequests(StatusBypassFailOpen, requestPath)
-				span.SetAttributes(attribute.String("idempotency.status", StatusBypassFailOpen.String()))
-				if log != nil {
-					log.Warn().
-						Str(ulog.LogKeyTraceID, traceID).
-						Str("idempotency_key", idempotencyKey).
-						Msg("Circuit Breaker is OPEN. Idempotency layer bypassed (Fail-Open).")
-				}
-				next.ServeHTTP(w, r.WithContext(ctx))
-				return
-			}
-
-			coalesceTimeout := cfg.CoalesceTimeout
-			if deadline, ok := ctx.Deadline(); ok {
-				if clientTimeout := time.Until(deadline) - 50*time.Millisecond; clientTimeout < coalesceTimeout {
-					coalesceTimeout = clientTimeout
-					if coalesceTimeout <= 0 {
-						span.RecordError(errors.New("deadline exceeded prior to locking"))
-						http.Error(w, "Context deadline exceeded prior to locking", http.StatusGatewayTimeout)
-						return
-					}
-				}
-			}
-
-			hashReader := newHashingReader(r.Body, cfg.MaxRequestPayloadLimit)
-			r.Body = hashReader
-
-			isRedisAvailable := true
-			startTime := time.Now()
-			var record *IdempotentRecord
-
-			for {
-				status, rec, err := repo.EvaluateIdempotency(ctx, idempotencyKey, "", cfg.LockTTL)
-				cb.RecordResult(err)
-				if err != nil {
-					span.RecordError(err)
-					isRedisAvailable = false
-					break
-				}
-
-				if status == "MISS" {
-					break
-				}
-				if status == "HIT" {
-					record = rec
-					break
-				}
-
-				if time.Since(startTime) > coalesceTimeout {
-					if cfg.RetryAfter > 0 {
-						w.Header().Set("Retry-After", strconv.Itoa(max(1, int(cfg.RetryAfter.Seconds()))))
-					}
-					if cfg.ResponseStatusHeader != "" {
-						w.Header().Set(cfg.ResponseStatusHeader, StatusProcessing.String())
-					}
-					globalMetrics.IncRequests(StatusProcessing, requestPath)
-					span.SetAttributes(attribute.String("idempotency.status", StatusProcessing.String()))
-					http.Error(w, "Concurrent processing timeout", http.StatusTooEarly)
-					return
-				}
-
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(DefaultCoalesceInterval):
-				}
-			}
-
-			if record != nil {
-				if record.PayloadHash != "" {
-					_, _ = io.Copy(io.Discard, hashReader)
-					incomingHash := hashReader.Sum()
-
-					if hashReader.TooLarge || incomingHash != record.PayloadHash {
-						if cfg.ResponseStatusHeader != "" {
-							w.Header().Set(cfg.ResponseStatusHeader, StatusConflict.String())
-						}
-						globalMetrics.IncRequests(StatusConflict, requestPath)
-						span.SetAttributes(attribute.String("idempotency.status", StatusConflict.String()))
-						http.Error(w, "Idempotency Key payload mismatch", http.StatusConflict)
-						return
-					}
-				}
-
-				if cfg.ResponseStatusHeader != "" {
-					w.Header().Set(cfg.ResponseStatusHeader, StatusHit.String())
-				}
-				for key, values := range record.ResponseHeaders {
-					for _, value := range values {
-						w.Header().Add(key, value)
-					}
-				}
-				span.SetAttributes(attribute.String("idempotency.status", StatusHit.String()))
-				w.WriteHeader(record.StatusCode)
-				_, _ = w.Write(record.ResponseBody)
-				return
-			}
-
-			stopRenewal := make(chan struct{})
-			if isRedisAvailable {
-				go func() {
-					ticker := time.NewTicker(cfg.LockTTL / 3)
-					defer ticker.Stop()
-					for {
-						select {
-						case <-ticker.C:
-							if extended, _ := repo.ExtendLock(ctx, idempotencyKey, "", cfg.LockTTL); !extended {
-								return
-							}
-						case <-ctx.Done():
-							_ = repo.Unlock(ctx, idempotencyKey)
-							return
-						case <-stopRenewal:
-							return
-						}
-					}
-				}()
-				defer func() {
-					close(stopRenewal)
-					_ = repo.Unlock(ctx, idempotencyKey)
-				}()
-			}
-
-			buf := bufferPool.Get().(*bytes.Buffer)
-			buf.Reset()
-			defer bufferPool.Put(buf)
-
-			crw := NewProductionResponseWriter(w, buf, cfg.MaxCacheBodySize, cfg.ResponseStatusHeader)
-			statusTag := StatusMiss
-			if !isRedisAvailable {
-				statusTag = StatusBypassFailOpen
-			}
-
-			next.ServeHTTP(crw, r.WithContext(ctx))
-
-			computedHash := hashReader.Sum()
-			if hashReader.TooLarge || crw.TooLarge {
-				statusTag = StatusBypassTooLarge
-			}
-
-			if isRedisAvailable && crw.StatusCode < 500 && statusTag == StatusMiss && ctx.Err() == nil {
-				rawHeaders := crw.Header()
-				filteredHeaders := make(map[string][]string, len(rawHeaders))
-				for key, values := range rawHeaders {
-					if hopByHopHeaders[strings.ToLower(key)] {
-						continue
-					}
-					filteredHeaders[key] = values
-				}
-
-				savedRecord := &IdempotentRecord{
-					Key:             idempotencyKey,
-					PayloadHash:     computedHash,
-					StatusCode:      crw.StatusCode,
-					ResponseBody:    getBufferBytesCopy(crw.Body),
-					ResponseHeaders: filteredHeaders,
-					CreatedAt:       time.Now(),
-				}
-
-				saveErr := repo.Save(ctx, savedRecord, cfg.ResponseTTL)
-				cb.RecordResult(saveErr)
-			}
-
-			span.SetAttributes(attribute.String("idempotency.status", statusTag.String()))
-			crw.Commit(statusTag.String())
-		})
+	m := &middleware{
+		locker: locker,
+		saver:  saver,
+		log:    log,
+		cfg:    cfg,
+		cb:     NewCircuitBreaker(cfg.CircuitBreakerThreshold, cfg.CircuitBreakerCooldown),
+		bufferPool: &sync.Pool{
+			New: func() any {
+				return bytes.NewBuffer(make([]byte, 0, 4096))
+			},
+		},
 	}
+
+	return m.handler
 }
 
-func getBufferBytesCopy(b *bytes.Buffer) []byte {
-	cb := make([]byte, b.Len())
-	copy(cb, b.Bytes())
-	return cb
+// isMutatingMethod проверяет, относится ли HTTP-метод к мутирующим операциям,
+// требующим проверки идемпотентности (POST, PUT, PATCH).
+func isMutatingMethod(method string) bool {
+	return method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch
+}
+
+// handler оборачивает следующий http.Handler в слой дедупликации и защиты от гонок.
+func (m *middleware) handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isMutatingMethod(r.Method) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		requestPath := r.URL.Path
+		traceID := ulog.GetTraceID(r.Context())
+		idempotencyKey := m.cfg.KeyExtractor(r)
+
+		if idempotencyKey == "" {
+			http.Error(w, "Idempotency key is missing", http.StatusBadRequest)
+			return
+		}
+
+		ctx, span := m.cfg.Tracer.Start(r.Context(), "idempotency.middleware",
+			trace.WithSpanKind(trace.SpanKindInternal),
+			trace.WithAttributes(
+				attribute.String("idempotency.key", idempotencyKey),
+				attribute.String("idempotency.path", requestPath),
+				attribute.String("ulog.trace_id", traceID),
+			),
+		)
+		defer span.End()
+
+		span.SetAttributes(attribute.String("circuit_breaker.state", m.cb.State()))
+
+		if !m.cb.Allow() {
+			if m.cfg.FailureStrategy == FailClosed {
+				m.setStatusHeader(w, StatusFailClosed)
+				globalMetrics.IncRequests(StatusFailClosed, requestPath)
+				span.SetAttributes(attribute.String("idempotency.status", StatusFailClosed.String()))
+				if m.log != nil {
+					m.log.Info("Circuit Breaker is OPEN. Request rejected (Fail-Closed).",
+						ulog.String("idempotency_key", idempotencyKey),
+					)
+				}
+				http.Error(w, "Idempotency store unavailable", http.StatusServiceUnavailable)
+				return
+			}
+
+			m.setStatusHeader(w, StatusBypassFailOpen)
+			globalMetrics.IncRequests(StatusBypassFailOpen, requestPath)
+			span.SetAttributes(attribute.String("idempotency.status", StatusBypassFailOpen.String()))
+			if m.log != nil {
+				m.log.Info("Circuit Breaker is OPEN. Idempotency layer bypassed (Fail-Open).",
+					ulog.String("idempotency_key", idempotencyKey),
+				)
+			}
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
+		coalesceTimeout := m.cfg.CoalesceTimeout
+		if deadline, ok := ctx.Deadline(); ok {
+			if clientTimeout := time.Until(deadline) - 50*time.Millisecond; clientTimeout < coalesceTimeout {
+				coalesceTimeout = clientTimeout
+				if coalesceTimeout <= 0 {
+					span.RecordError(ErrDeadlinePriorToLock)
+					http.Error(w, ErrDeadlinePriorToLock.Error(), http.StatusGatewayTimeout)
+					return
+				}
+			}
+		}
+
+		hashReader := newHashingReader(r.Body, m.cfg.MaxRequestPayloadLimit)
+		r.Body = hashReader
+
+		ownerToken := rand.Text()
+		isStoreAvailable := true
+		startTime := time.Now()
+		var record *IdempotentRecord
+
+		for {
+			evalStatus, rec, err := m.locker.Evaluate(ctx, idempotencyKey, ownerToken, m.cfg.LockTTL)
+			m.cb.RecordResult(err)
+			if err != nil {
+				span.RecordError(err)
+				if m.cfg.FailureStrategy == FailClosed {
+					m.setStatusHeader(w, StatusFailClosed)
+					globalMetrics.IncRequests(StatusFailClosed, requestPath)
+					span.SetAttributes(attribute.String("idempotency.status", StatusFailClosed.String()))
+					if m.log != nil {
+						m.log.Error("Idempotency store error. Request rejected (Fail-Closed).",
+							err,
+							ulog.String("idempotency_key", idempotencyKey),
+						)
+					}
+					http.Error(w, "Idempotency store unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				isStoreAvailable = false
+				break
+			}
+
+			if evalStatus == EvalMiss {
+				break
+			}
+			if evalStatus == EvalHit {
+				record = rec
+				break
+			}
+
+			if time.Since(startTime) > coalesceTimeout {
+				if m.cfg.RetryAfter > 0 {
+					w.Header().Set("Retry-After", strconv.Itoa(max(1, int(m.cfg.RetryAfter.Seconds()))))
+				}
+				m.setStatusHeader(w, StatusProcessing)
+				globalMetrics.IncRequests(StatusProcessing, requestPath)
+				span.SetAttributes(attribute.String("idempotency.status", StatusProcessing.String()))
+				http.Error(w, "Concurrent processing timeout", http.StatusTooEarly)
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(m.cfg.CoalesceInterval):
+			}
+		}
+
+		if record != nil {
+			if record.PayloadHash != "" {
+				_, _ = io.Copy(io.Discard, hashReader)
+				incomingHash := hashReader.Sum()
+
+				if hashReader.TooLarge || incomingHash != record.PayloadHash {
+					m.setStatusHeader(w, StatusConflict)
+					globalMetrics.IncRequests(StatusConflict, requestPath)
+					span.SetAttributes(attribute.String("idempotency.status", StatusConflict.String()))
+					http.Error(w, "Idempotency Key payload mismatch", m.cfg.ConflictStatusCode)
+					return
+				}
+			}
+
+			copyCachedHeaders(w.Header(), record.ResponseHeaders)
+			if !record.CreatedAt.IsZero() {
+				w.Header().Set(HeaderOriginalDate, record.CreatedAt.UTC().Format(http.TimeFormat))
+			}
+			m.setStatusHeader(w, StatusHit)
+			globalMetrics.IncRequests(StatusHit, requestPath)
+			span.SetAttributes(attribute.String("idempotency.status", StatusHit.String()))
+			w.WriteHeader(record.StatusCode)
+			_, _ = w.Write(record.ResponseBody)
+			return
+		}
+
+		stopRenewal := make(chan struct{})
+		if isStoreAvailable {
+			go func() {
+				ticker := time.NewTicker(m.cfg.LockTTL / 3)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						if extended, _ := m.locker.ExtendLock(ctx, idempotencyKey, ownerToken, m.cfg.LockTTL); !extended {
+							return
+						}
+					case <-ctx.Done():
+						unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+						_ = m.locker.Unlock(unlockCtx, idempotencyKey, ownerToken)
+						cancel()
+						return
+					case <-stopRenewal:
+						return
+					}
+				}
+			}()
+			defer func() {
+				close(stopRenewal)
+				unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+				_ = m.locker.Unlock(unlockCtx, idempotencyKey, ownerToken)
+				cancel()
+			}()
+		}
+
+		buf := m.bufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer m.bufferPool.Put(buf)
+
+		crw := NewProductionResponseWriter(w, buf, m.cfg.MaxCacheBodySize, m.cfg.ResponseStatusHeader)
+		statusTag := StatusMiss
+		if !isStoreAvailable {
+			statusTag = StatusBypassFailOpen
+		}
+
+		next.ServeHTTP(crw, r.WithContext(ctx))
+
+		computedHash := hashReader.Sum()
+		if hashReader.TooLarge || crw.TooLarge {
+			statusTag = StatusBypassTooLarge
+		}
+
+		if isStoreAvailable && crw.StatusCode < 500 && statusTag == StatusMiss && ctx.Err() == nil {
+			savedRecord := &IdempotentRecord{
+				Key:             idempotencyKey,
+				PayloadHash:     computedHash,
+				StatusCode:      crw.StatusCode,
+				ResponseBody:    bytes.Clone(crw.Body.Bytes()),
+				ResponseHeaders: filterHeaders(crw.Header(), m.cfg.ResponseStatusHeader),
+				CreatedAt:       time.Now().UTC(),
+			}
+
+			saveErr := m.saver.Save(ctx, savedRecord, m.cfg.ResponseTTL)
+			m.cb.RecordResult(saveErr)
+			if saveErr != nil {
+				span.RecordError(saveErr)
+				if m.log != nil {
+					m.log.Error("Failed to save idempotent response record.",
+						saveErr,
+						ulog.String("idempotency_key", idempotencyKey),
+					)
+				}
+			}
+		}
+
+		globalMetrics.IncRequests(statusTag, requestPath)
+		span.SetAttributes(attribute.String("idempotency.status", statusTag.String()))
+		crw.Commit(statusTag.String())
+	})
+}
+
+// setStatusHeader записывает диагностический статус идемпотентности в заголовок ответа,
+// если имя заголовка не пустое.
+func (m *middleware) setStatusHeader(w http.ResponseWriter, status Status) {
+	if m.cfg.ResponseStatusHeader != "" {
+		w.Header().Set(m.cfg.ResponseStatusHeader, status.String())
+	}
 }

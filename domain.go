@@ -1,6 +1,5 @@
-// Package idempotency предоставляет высокопроизводительный Chi-совместимый middleware транспортного уровня.
-// Модуль реализует паттерн «Идемпотентность» для High-Load микросервисов, защищая распределенное ядро
-// от повторных списаний средств и дублирования сущностей при сетевых сбоях.
+// Package idempotency предоставляет высокопроизводительный HTTP-middleware
+// для обеспечения идемпотентности мутирующих запросов в распределенных системах.
 package idempotency
 
 import (
@@ -8,76 +7,61 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ioncode/ulog"
+	"github.com/ioncode/ulog/v3"
 )
 
-// Status определяет строковый тип для внутренних состояний обработки идемпотентности.
+const (
+	HeaderIdempotencyKey  = "Idempotency-Key"
+	HeaderIdempotencyStat = "X-Idempotency-Status"
+)
+
 type Status string
 
 const (
-	// StatusHit означает, что ответ успешно взят и воспроизведен из распределенного кэша.
-	StatusHit Status = "HIT"
-
-	// StatusMiss означает, что это первый уникальный запрос, который ушел на выполнение в бизнес-логику.
-	StatusMiss Status = "MISS"
-
-	// StatusConflict означает, что пришел тот же ключ, но с другим телом запроса (изменение payload).
-	StatusConflict Status = "CONFLICT"
-
-	// StatusProcessing означает, что идентичный параллельный запрос уже обрабатывается другой горутиной.
-	StatusProcessing Status = "PROCESSING"
-
-	// StatusBypassFailOpen означает, что хранилище (Redis) деградировало, и запрос пропущен без проверки.
+	StatusHit            Status = "HIT"
+	StatusMiss           Status = "MISS"
+	StatusConflict       Status = "CONFLICT"
+	StatusProcessing     Status = "PROCESSING"
 	StatusBypassFailOpen Status = "BYPASS_FAIL_OPEN"
-
-	// StatusBypassTooLarge означает, что размер ответа превысил лимит RAM, и кэширование пропущено во избежание OOM.
+	StatusFailClosed     Status = "FAIL_CLOSED"
 	StatusBypassTooLarge Status = "BYPASS_TOO_LARGE"
 )
 
-// String возвращает строковое представление статуса.
 func (s Status) String() string {
 	return string(s)
 }
 
-// KeyExtractor определяет сигнатуру функции для динамического извлечения ключа идемпотентности из HTTP-запроса.
+type EvaluationStatus string
+
+const (
+	EvalMiss   EvaluationStatus = "MISS"
+	EvalHit    EvaluationStatus = "HIT"
+	EvalLocked EvaluationStatus = "LOCKED"
+)
+
 type KeyExtractor func(r *http.Request) string
+type Logger = ulog.Logger
 
-// LoggerEvent описывает событие логирования, совместимое с Fluent API библиотеки ulog.
-type LoggerEvent interface {
-	Str(key string, val string) LoggerEvent
-	Int(key string, val int) LoggerEvent
-	Err(err error) LoggerEvent
-	Msg(msg string)
-}
-
-// Logger описывает методы логирования на уровне интерфейса приложения для изоляции слоев.
-type Logger interface {
-	Info() ulog.LoggerEvent
-	Warn() ulog.LoggerEvent
-	Error() ulog.LoggerEvent
-}
-
-// IdempotentRecord описывает структуру сохраненного HTTP-ответа в кэше.
 type IdempotentRecord struct {
-	Key             string
-	PayloadHash     string
-	StatusCode      int
-	ResponseBody    []byte
-	ResponseHeaders map[string][]string
-	CreatedAt       time.Time
+	Key             string      `json:"key"`
+	PayloadHash     string      `json:"payload_hash"`
+	StatusCode      int         `json:"status_code"`
+	ResponseBody    []byte      `json:"response_body,omitempty"`
+	ResponseHeaders http.Header `json:"response_headers,omitempty"`
+	CreatedAt       time.Time   `json:"created_at"`
 }
 
-// Repository — атомарный контракт для хранения данных идемпотентности и управления блокировками.
-type Repository interface {
-	// EvaluateIdempotency атомарно проверяет лок и кэш данных в Redis с помощью Lua-скрипта.
-	EvaluateIdempotency(ctx context.Context, key string, payloadHash string, ttl time.Duration) (string, *IdempotentRecord, error)
+type Locker interface {
+	Evaluate(ctx context.Context, key string, ownerToken string, ttl time.Duration) (EvaluationStatus, *IdempotentRecord, error)
+	ExtendLock(ctx context.Context, key string, ownerToken string, ttl time.Duration) (bool, error)
+	Unlock(ctx context.Context, key string, ownerToken string) error
+}
 
-	// ExtendLock атомарно продлевает время жизни блокировки (Heartbeat) во время долгой работы хэндлера.
-	ExtendLock(ctx context.Context, key string, payloadHash string, ttl time.Duration) (bool, error)
-
-	// Unlock снимает распределенную блокировку.
-	Unlock(ctx context.Context, key string) error
-
-	// Save персистирует успешный HTTP-ответ в хранилище.
+type Saver interface {
 	Save(ctx context.Context, record *IdempotentRecord, ttl time.Duration) error
+}
+
+type Store interface {
+	Locker
+	Saver
 }

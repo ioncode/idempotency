@@ -5,10 +5,8 @@ import (
 	"net/http"
 )
 
-// ProductionResponseWriter реализует гибридный перехватчик HTTP-ответа.
-// Пока объем ответа не превышает MaxBodySize, данные накапливаются в буфере (что позволяет
-// выставить точный X-Idempotency-Status до отправки заголовков в сеть). При превышении лимита
-// буфер сбрасывается клиенту, и writer переключается в режим прямого стриминга.
+// ProductionResponseWriter реализует гибридный перехватчик HTTP-ответа с буферизацией в памяти до MaxBodySize
+// и автоматическим переходом на стриминг при превышении лимита или принудительном вызове Flush.
 type ProductionResponseWriter struct {
 	w             http.ResponseWriter
 	Body          *bytes.Buffer
@@ -17,9 +15,10 @@ type ProductionResponseWriter struct {
 	statusHeader  string
 	TooLarge      bool
 	headerFlushed bool
+	wroteHeader   bool
 }
 
-// NewProductionResponseWriter инициализирует перехватчик ответа с поддержкой отложенной отправки заголовков.
+// NewProductionResponseWriter создает новый экземпляр ProductionResponseWriter.
 func NewProductionResponseWriter(w http.ResponseWriter, buf *bytes.Buffer, maxSize int, statusHeader string) *ProductionResponseWriter {
 	return &ProductionResponseWriter{
 		w:            w,
@@ -30,29 +29,33 @@ func NewProductionResponseWriter(w http.ResponseWriter, buf *bytes.Buffer, maxSi
 	}
 }
 
-// Header возвращает карту HTTP-заголовков оригинального http.ResponseWriter.
+// Unwrap возвращает оригинальный http.ResponseWriter для поддержки http.ResponseController.
+func (w *ProductionResponseWriter) Unwrap() http.ResponseWriter {
+	return w.w
+}
+
+// Header делегирует получение заголовков оригинальному ResponseWriter.
 func (w *ProductionResponseWriter) Header() http.Header {
 	return w.w.Header()
 }
 
-// WriteHeader запоминает HTTP статус-код ответа, откладывая реальную отправку заголовков
-// до завершения запроса или превышения лимита буферизации.
+// WriteHeader сохраняет статус-код, игнорируя повторные вызовы.
 func (w *ProductionResponseWriter) WriteHeader(statusCode int) {
-	if w.headerFlushed {
+	if w.headerFlushed || w.wroteHeader {
 		return
 	}
 	w.StatusCode = statusCode
+	w.wroteHeader = true
 }
 
-// Write буферизирует ответ в пределах MaxBodySize. При выходе за лимит переводит writer
-// в режим прямого стриминга в сетевой сокет с выставлением статуса BYPASS_TOO_LARGE.
+// Write записывает данные в буфер или переключается на прямой стриминг при превышении MaxBodySize.
 func (w *ProductionResponseWriter) Write(b []byte) (int, error) {
-	// Если уже в режиме стриминга — пишем напрямую в сокет
+	w.wroteHeader = true
+
 	if w.TooLarge {
 		return w.w.Write(b)
 	}
 
-	// Проверяем, не превысит ли новый чанк лимит кэширования в RAM
 	if w.MaxBodySize > 0 && w.Body.Len()+len(b) > w.MaxBodySize {
 		w.TooLarge = true
 		w.flushToStream(StatusBypassTooLarge.String())
@@ -62,8 +65,6 @@ func (w *ProductionResponseWriter) Write(b []byte) (int, error) {
 	return w.Body.Write(b)
 }
 
-// flushToStream отправляет заголовки, статус-код и накопленный буфер в реальный http.ResponseWriter,
-// освобождая буфер памяти для защиты от OOM.
 func (w *ProductionResponseWriter) flushToStream(statusValue string) {
 	if w.headerFlushed {
 		return
@@ -80,8 +81,7 @@ func (w *ProductionResponseWriter) flushToStream(statusValue string) {
 	}
 }
 
-// Commit завершает отправку ответа клиенту, если хендлер уложился в лимит кэширования
-// и данные еще не были сброшены в потоковый режим.
+// Commit фиксирует ответ и отправляет накопленный буфер клиенту.
 func (w *ProductionResponseWriter) Commit(statusValue string) {
 	if w.headerFlushed {
 		return
@@ -97,8 +97,7 @@ func (w *ProductionResponseWriter) Commit(statusValue string) {
 	}
 }
 
-// Flush принудительно переводит ответ в потоковый режим (если он еще в буфере)
-// и делегирует сброс данных интерфейсу http.Flusher (для SSE и стриминга).
+// Flush переводит writer в потоковый режим и вызывает Flush у нижележащего хэндлера при его наличии.
 func (w *ProductionResponseWriter) Flush() {
 	if !w.headerFlushed {
 		w.TooLarge = true

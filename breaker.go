@@ -8,23 +8,32 @@ import (
 )
 
 const (
-	// StateClosed означает, что цепь замкнута, Redis здоров, и запросы проходят стандартную проверку.
+	// StateClosed означает, что цепь замкнута, хранилище доступно,
+	// и запросы проходят стандартную проверку идемпотентности.
 	StateClosed = "CLOSED"
-	// StateOpen означает, что цепь разомкнута из-за сбоев, и активирована стратегия Fail-Open.
+
+	// StateOpen означает, что цепь разомкнута из-за серии сбоев хранилища,
+	// и активирована выбранная стратегия обработки отказов (Fail-Open или Fail-Closed).
 	StateOpen = "OPEN"
-	// StateHalfOpen означает, что истек cooldown-таймаут, и цепь пропускает один пробный запрос для проверки восстановления Redis.
+
+	// StateHalfOpen означает, что истек cooldown-таймаут, и цепь пропускает
+	// один пробный запрос для проверки восстановления хранилища.
 	StateHalfOpen = "HALF_OPEN"
 )
 
 const (
-	// DefaultCircuitBreakerThreshold — количество последовательных сбоев Redis, после которого цепь размыкается.
+	// DefaultCircuitBreakerThreshold — количество последовательных сбоев хранилища
+	// по умолчанию, после которого цепь размыкается.
 	DefaultCircuitBreakerThreshold = 5
-	// DefaultCircuitBreakerCooldown — время охлаждения, после которого предохранитель переходит в Half-Open.
+
+	// DefaultCircuitBreakerCooldown — время охлаждения по умолчанию,
+	// по истечении которого предохранитель переходит в состояние StateHalfOpen.
 	DefaultCircuitBreakerCooldown = 30 * time.Second
 )
 
-// circuitBreaker реализует конечный автомат защиты Go-процесса от сетевых деградаций Redis.
-type circuitBreaker struct {
+// CircuitBreaker реализует потокобезопасный конечный автомат (CLOSED -> OPEN -> HALF_OPEN)
+// для изоляции приложения от сетевых деградаций и таймаутов хранилища идемпотентности.
+type CircuitBreaker struct {
 	mu               sync.RWMutex
 	state            string
 	failureCount     int
@@ -33,23 +42,37 @@ type circuitBreaker struct {
 	lastStateMod     time.Time
 }
 
-// NewCircuitBreaker инициализирует предохранитель в состоянии CLOSED с заданным порогом сбоев и временем восстановления.
-func NewCircuitBreaker(threshold int, cooldown time.Duration) *circuitBreaker {
+// NewCircuitBreaker инициализирует предохранитель в состоянии StateClosed
+// с заданным порогом последовательных сбоев и временем восстановления.
+// Если переданы неположительные значения, применяются DefaultCircuitBreakerThreshold
+// и DefaultCircuitBreakerCooldown.
+func NewCircuitBreaker(threshold int, cooldown time.Duration) *CircuitBreaker {
 	if threshold <= 0 {
 		threshold = DefaultCircuitBreakerThreshold
 	}
 	if cooldown <= 0 {
 		cooldown = DefaultCircuitBreakerCooldown
 	}
-	return &circuitBreaker{
+	return &CircuitBreaker{
 		state:            StateClosed,
 		failureThreshold: threshold,
 		cooldownTimeout:  cooldown,
 	}
 }
 
-// Allow проверяет состояние предохранителя и управляет переходом в HALF_OPEN по истечении cooldown-таймаута.
-func (cb *circuitBreaker) Allow() bool {
+// State потокобезопасно возвращает текущее состояние предохранителя
+// (StateClosed, StateOpen или StateHalfOpen).
+func (cb *CircuitBreaker) State() string {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.state
+}
+
+// Allow проверяет, разрешено ли выполнение операции с хранилищем идемпотентности.
+// В состоянии StateClosed возвращает true. В состоянии StateOpen по истечении
+// cooldownTimeout переводит предохранитель в StateHalfOpen по паттерну
+// Double-Checked Locking, гарантируя пропуск ровно одного пробного запроса.
+func (cb *CircuitBreaker) Allow() bool {
 	cb.mu.RLock()
 	state := cb.state
 	expired := state == StateOpen && time.Since(cb.lastStateMod) > cb.cooldownTimeout
@@ -73,9 +96,12 @@ func (cb *circuitBreaker) Allow() bool {
 	return false
 }
 
-// RecordResult фиксирует результат сетевой операции. Достижение порога ошибок размыкает цепь.
-// Клиентские отмены контекста (Canceled/DeadlineExceeded) игнорируются и не влияют на счетчик сбоев.
-func (cb *circuitBreaker) RecordResult(err error) {
+// RecordResult фиксирует исход операции взаимодействия с хранилищем идемпотентности.
+// При отсутствии ошибки сбрасывает счетчик сбоев и замыкает цепь (StateClosed).
+// При достижении failureThreshold переводит цепь в состояние StateOpen.
+// Клиентские отмены контекста (context.Canceled и context.DeadlineExceeded)
+// игнорируются и не влияют на состояние предохранителя.
+func (cb *CircuitBreaker) RecordResult(err error) {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return
 	}
@@ -89,7 +115,11 @@ func (cb *circuitBreaker) RecordResult(err error) {
 		return
 	}
 
-	// Неудачный пробный запрос в состоянии HALF_OPEN немедленно возвращает цепь в OPEN на новый цикл ожидания.
+	if cb.state == StateOpen {
+		return
+	}
+
+	// Неудачный пробный запрос в состоянии StateHalfOpen немедленно возвращает цепь в StateOpen.
 	if cb.state == StateHalfOpen {
 		cb.state = StateOpen
 		cb.lastStateMod = time.Now()

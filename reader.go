@@ -5,11 +5,15 @@ import (
 	"encoding/hex"
 	"hash"
 	"io"
+	"net/http"
 )
 
-// hashingReader реализует потоковое вычисление SHA-256 для входящего тела запроса.
-// Если размер входящих данных превышает maxBodySize, хэширование прекращается
-// для защиты CPU от атак, но оригинальный поток данных НЕ обрывается.
+// hashingReader реализует потоковое вычисление SHA-256 для входящего тела HTTP-запроса
+// без предварительной буферизации всего payload в оперативную память.
+//
+// При превышении лимита maxBodySize криптографическое хеширование прекращается
+// и сбрасывается для защиты CPU от DoS-атак, однако чтение исходного потока
+// для нижележащего обработчика продолжается в штатном режиме.
 type hashingReader struct {
 	rc          io.ReadCloser
 	hasher      hash.Hash
@@ -18,8 +22,12 @@ type hashingReader struct {
 	TooLarge    bool
 }
 
-// newHashingReader инициализирует потоковый ридер с контролем лимита байт.
+// newHashingReader инициализирует потоковый ридер с контролем максимального размера payload.
+// Если rc равен nil, используется http.NoBody.
 func newHashingReader(rc io.ReadCloser, maxRequestSize int64) *hashingReader {
+	if rc == nil {
+		rc = http.NoBody
+	}
 	return &hashingReader{
 		rc:          rc,
 		hasher:      sha256.New(),
@@ -27,12 +35,12 @@ func newHashingReader(rc io.ReadCloser, maxRequestSize int64) *hashingReader {
 	}
 }
 
-// Read перехватывает байты из сетевого потока и параллельно отправляет их в криптографический хэшер.
+// Read читает данные из нижележащего потока и параллельно передает их в SHA-256 хешер,
+// пока суммарный объем прочитанных данных не превысит maxBodySize.
 func (hr *hashingReader) Read(p []byte) (n int, err error) {
 	n, err = hr.rc.Read(p)
 	if n > 0 && !hr.TooLarge {
 		hr.readBytes += int64(n)
-
 		if hr.maxBodySize > 0 && hr.readBytes > hr.maxBodySize {
 			hr.TooLarge = true
 			hr.hasher.Reset()
@@ -43,13 +51,17 @@ func (hr *hashingReader) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
-// Close закрывает нижележащий сетевой поток чтения тела запроса.
-func (hr *hashingReader) Close() error { return hr.rc.Close() }
+// Close закрывает нижележащий поток чтения тела запроса.
+func (hr *hashingReader) Close() error {
+	return hr.rc.Close()
+}
 
-// Sum возвращает финальный строковый SHA-256 хэш, если лимит памяти не был превышен.
+// Sum возвращает hex-представление вычисленной контрольной суммы SHA-256.
+// Если во время чтения был превышен лимит maxBodySize (TooLarge == true), возвращается пустая строка.
 func (hr *hashingReader) Sum() string {
 	if hr.TooLarge {
 		return ""
 	}
-	return hex.EncodeToString(hr.hasher.Sum(nil))
+	var sum [sha256.Size]byte
+	return hex.EncodeToString(hr.hasher.Sum(sum[:0]))
 }

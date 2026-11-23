@@ -15,11 +15,12 @@ import (
 	"time"
 
 	"github.com/ioncode/idempotency"
-	"github.com/ioncode/ulog"
+	"github.com/ioncode/ulog/v3/adapters/uzerolog"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 
 	toxiClient "github.com/Shopify/toxiproxy/v2/client"
+	redisstore "github.com/ioncode/idempotency/store/redis"
 	redisClient "github.com/redis/go-redis/v9"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/network"
@@ -33,7 +34,7 @@ func TestIdempotency_ChaosNetwork_CircuitBreaker(t *testing.T) {
 	baseLog := zerolog.New(io.Discard)
 	//use console logger for debug
 	//baseLog := zerolog.New(os.Stdout).With().Timestamp().Logger()
-	logAdapter := ulog.NewZerologAdapter(baseLog)
+	logAdapter := uzerolog.NewZerologAdapter(baseLog)
 
 	net, err := network.New(ctx, network.WithDriver("bridge"))
 	if err != nil {
@@ -105,8 +106,9 @@ func TestIdempotency_ChaosNetwork_CircuitBreaker(t *testing.T) {
 	})
 	defer rdb.Close()
 
-	repo := idempotency.NewRedisRepository(rdb)
+	repo := redisstore.New(rdb)
 	middleware := idempotency.NewMiddleware(
+		repo,
 		repo,
 		logAdapter,
 		idempotency.WithCoalesceTimeout(2*time.Second),

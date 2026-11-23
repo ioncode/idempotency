@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795433521035,
+  "lastUpdate": 1795441898198,
   "repoUrl": "https://github.com/ioncode/idempotency",
   "entries": {
     "Benchmark": [
@@ -1012,6 +1012,78 @@ window.BENCHMARK_DATA = {
             "value": 56,
             "unit": "allocs/op",
             "extra": "151449 times\n4 procs"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "ionrussia@gmail.com",
+            "name": "Andrey Ponteleev",
+            "username": "ioncode"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "17a4c6ac55ef0b3c0d181449123c6f15ac52806a",
+          "message": "Merge pull request #5 from ioncode/dev\n\nDev",
+          "timestamp": "2026-11-23T16:49:41+03:00",
+          "tree_id": "55850a64a982bef27e45ca3adfed5ea96fc79c4b",
+          "url": "https://github.com/ioncode/idempotency/commit/17a4c6ac55ef0b3c0d181449123c6f15ac52806a"
+        },
+        "date": 1795441897434,
+        "tool": "go",
+        "benches": [
+          {
+            "name": "BenchmarkMiddleware_CacheHit",
+            "value": 4076,
+            "unit": "ns/op\t    7759 B/op\t      41 allocs/op",
+            "extra": "277453 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheHit - ns/op",
+            "value": 4076,
+            "unit": "ns/op",
+            "extra": "277453 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheHit - B/op",
+            "value": 7759,
+            "unit": "B/op",
+            "extra": "277453 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheHit - allocs/op",
+            "value": 41,
+            "unit": "allocs/op",
+            "extra": "277453 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheMiss",
+            "value": 9735,
+            "unit": "ns/op\t    9122 B/op\t      56 allocs/op",
+            "extra": "106148 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheMiss - ns/op",
+            "value": 9735,
+            "unit": "ns/op",
+            "extra": "106148 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheMiss - B/op",
+            "value": 9122,
+            "unit": "B/op",
+            "extra": "106148 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMiddleware_CacheMiss - allocs/op",
+            "value": 56,
+            "unit": "allocs/op",
+            "extra": "106148 times\n4 procs"
           }
         ]
       }

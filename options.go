@@ -32,9 +32,6 @@ const (
 
 	// DefaultRetryAfter — значение заголовка Retry-After по умолчанию при возврате 425 Too Early / 409 Conflict.
 	DefaultRetryAfter = 2 * time.Second
-
-	// HeaderOriginalDate — заголовок с датой и временем первоначального выполнения запроса.
-	HeaderOriginalDate = "Original-Request-Date"
 )
 
 // FailureStrategy определяет поведение middleware при отказе или недоступности хранилища (Locker/Saver).

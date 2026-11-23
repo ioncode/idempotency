@@ -27,7 +27,7 @@
 go get github.com/ioncode/idempotency
 ```
 
-### 2. Интеграция в Chi Router с поддержкой OpenTelemetry и slog
+### 2. Интеграция в Chi Router с поддержкой OpenTelemetry и zerolog
 ```go
 package main
 
@@ -38,7 +38,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/ioncode/idempotency"
-	"github.com/ioncode/ulog"
+	"github.com/ioncode/ulog/v3"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel"

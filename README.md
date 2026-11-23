@@ -8,14 +8,15 @@
 
 ## ⚡ Ключевые архитектурные решения
 
-1. **Атомарные Lua-скрипты (`EVALSHA`):** Проверка распределенной блокировки (`TryLock`) и извлечение сохраненного ответа (`Get`) объединены в один атомарный Lua-скрипт на стороне Redis. Скрипт загружается и вызывается по SHA-хэшу за один сетевой round-trip.
-2. **Потоковый SHA-256 без буферизации тела запроса (`io.TeeReader`):** Хэш входящего payload вычисляется «на лету» по мере чтения потока бизнес-логикой, не загружая всё тело запроса в оперативную память, а при повторных запросах (`HIT`) проверяется на совпадение с возвратом `409 Conflict`.
-3. **Гибридный перехватчик ответа (`ProductionResponseWriter` + `sync.Pool`):** Внутренние буферы арендуются из пула `sync.Pool` для снижения нагрузки на GC. Пока ответ укладывается в `WithMaxCacheBodySize`, он накапливается в буфере; при превышении лимита или вызове `http.Flusher` (SSE) буфер мгновенно очищается, а данные передаются клиенту напрямую в сокет (Anti-OOM).
-4. **Защита CPU при тяжелых входящих запросах:** Если размер входящего тела превышает `WithMaxRequestPayloadLimit`, хэширование останавливается для защиты CPU, а запрос пропускается в бизнес-логику со статусом `BYPASS_TOO_LARGE` без кэширования.
-5. **Автопродление блокировок (Lock Renewal / Heartbeat):** Фоновая горутина периодически продлевает TTL блокировки в Redis, если обработка транзакции занимает больше базового таймаута, защищая от преждевременного снятия лока при долгих операциях.
-6. **Трехступенчатый Circuit Breaker (`CLOSED` → `OPEN` → `HALF_OPEN`):** Встроенный предохранитель изолирует сетевые сбои и таймауты Redis. При достижении порога ошибок (`WithCircuitBreakerThreshold`) цепь размыкается, и модуль переходит в режим `Fail-Open`, а по истечении `WithCircuitBreakerCooldown` пропускает ровно один пробный запрос (`Double-Checked Locking`) для автовосстановления.
-7. **Сквозная наблюдаемость (OpenTelemetry, Prometheus и `ulog`):** Модуль создает спаны `idempotency.middleware` с привязкой к `Trace ID` и экспортирует счетчики запросов и ошибок хранилища для Prometheus.
-8. **Гибкий `KeyExtractor` и составные ключи:** Поддерживается очистка кавычек по спецификации IETF, а также передача кастомной функции извлечения ключа (например, для формирования составного ключа `user_id + path + idempotency_key` в соответствии с разделом *Security Considerations* стандарта IETF).
+1. **Разделение интерфейсов и хранилищ (`Locker`/`Saver`):** ISP-контракты с адаптерами `store/redis` (standalone, Sentinel, Cluster) и потокобезопасным `store/memory` для тестов.
+2. **Атомарные Lua-скрипты и Fencing Tokens:** Операции в Redis выполняются через `EVALSHA` за один round-trip с защитой `ownerToken` (`crypto/rand.Text()`).
+3. **Потоковый SHA-256 без буферизации:** Хэширование «на лету» без загрузки тела в RAM. При дубле — возврат **`422 Unprocessable Entity`** (`WithConflictStatusCode`).
+4. **Гибридный перехватчик ответа (`sync.Pool`):** Буферизация ответа в памяти с защитой от OOM и сбросом в сокет при превышении лимита или использовании `http.Flusher` (SSE).
+5. **Защита CPU:** При превышении `WithMaxRequestPayloadLimit` расчет SHA-256 прерывается (`BYPASS_TOO_LARGE`).
+6. **Автопродление и безопасный `Unlock`:** Фоновое продление TTL и снятие лока через `context.WithoutCancel` при отмене клиентского контекста.
+7. **Circuit Breaker:** Трехступенчатый предохранитель (`CLOSED` → `OPEN` → `HALF_OPEN`) со стратегиями `FailOpen` (`BYPASS_FAIL_OPEN`) или **`503 Service Unavailable`** (`FailClosed`).
+8. **Наблюдаемость:** Интеграция с OpenTelemetry (спаны `idempotency.middleware` с Trace ID), Prometheus и `ulog/v3`.
+9. **`KeyExtractor` и IETF:** Очистка обрамляющих кавычек (RFC 8941), заголовок `Original-Request-Date` при `HIT` и составные ключи.
 
 ---
 
@@ -41,16 +42,18 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel"
+	redisstore "github.com/ioncode/idempotency/store/redis"
 )
 
 func main() {
 	// 1. Инициализация корпоративного логера ulog
 	baseLog := zerolog.New(os.Stdout).With().Timestamp().Logger()
-	logAdapter := ulog.NewZerologAdapter(baseLog)
+	logger := uzerolog.NewZerologAdapter(baseLog)
 
 	// 2. Инициализация инфраструктуры Redis
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	repo := idempotency.NewRedisRepository(rdb)
+	defer rdb.Close()
+	store := redisstore.New(rdb, redisstore.WithKeyPrefix("billing"))
 
 	// 3. Настройка кастомного извлечения ключа (например, из Query-параметров)
 	queryExtractor := func(r *http.Request) string {
@@ -59,8 +62,9 @@ func main() {
 
 	// 4. Создание высокопроизводительного middleware
 	idempMiddleware := idempotency.NewMiddleware(
-		repo,
-		logAdapter,
+		store,
+		store,
+		logger,
 		idempotency.WithKeyExtractor(queryExtractor),                           // Наш экстрактор
 		idempotency.WithResponseStatusHeader("X-Billing-Idempotency-Status"),    // Кастомный заголовок статуса
 		idempotency.WithLockTTL(5 * time.Second),                               // TTL блокировки в Redis
@@ -85,16 +89,17 @@ func main() {
 
 ## 📈 HTTP Статусы Идемпотентности (`X-Idempotency-Status`)
 
-Каждый мутирующий запрос (`POST`, `PUT`, `PATCH`) помечается диагностическим заголовком ответа (имя которого можно переопределить или отключить):
+Каждый мутирующий запрос (`POST`, `PUT`, `PATCH`) помечается диагностическим заголовком ответа (имя которого можно переопределить через `WithResponseStatusHeader` или отключить, передав пустую строку):
 
 | Статус | Описание | Действие модуля |
 | :--- | :--- | :--- |
-| **`MISS`** | Первый уникальный запрос. | Пропускает в бизнес-логику, блокирует конкурентов, сохраняет результат. |
-| **`HIT`** | Повторный вызов с тем же ключом. | Воспроизводит исходный HTTP-статус, тело и заголовки из кэша. |
-| **`CONFLICT`** | Ключ совпал, но тело запроса изменилось. | **409 Conflict**. Операция отклоняется во избежание порчи данных. |
-| **`PROCESSING`** | Предыдущий запрос еще выполняется. | **425 Too Early**. Предлагает клиенту повторить попытку позже. |
-| **`BYPASS_FAIL_OPEN`** | Кластер Redis деградировал или недоступен. | Стратегия Fail-Open: Circuit Breaker пускает запрос мимо Redis. |
-| **`BYPASS_TOO_LARGE`** | Размер запроса или ответа превысил лимиты. | Кэширование отменяется для защиты RAM/CPU, но API продолжает работу. |
+| **`MISS`** | Первый уникальный запрос. | Пропускает в бизнес-логику, удерживает блокировку (`ownerToken`), сохраняет результат в кэш. |
+| **`HIT`** | Повторный вызов с тем же ключом и телом запроса. | Мгновенно воспроизводит исходный HTTP-статус, тело, заголовки и добавляет `Original-Request-Date`. |
+| **`CONFLICT`** | Ключ совпал, но тело запроса (SHA-256) изменилось. | **`422 Unprocessable Entity`** (настраивается через `WithConflictStatusCode`). Операция отклоняется во избежание порчи данных. |
+| **`PROCESSING`** | Предыдущий запрос с тем же ключом еще выполняется, истек `WithCoalesceTimeout`. | **`425 Too Early`** с заголовком `Retry-After`. Предлагает клиенту повторить попытку позже. |
+| **`BYPASS_FAIL_OPEN`** | Хранилище недоступно, активна стратегия `FailOpen` (по умолчанию). | Circuit Breaker пропускает запрос напрямую в бизнес-логику без дедупликации. |
+| **`FAIL_CLOSED`** | Хранилище недоступно, активна стратегия `WithFailureStrategy(FailClosed)`. | **`503 Service Unavailable`**. Запрос отклоняется без вызова бизнес-логики для защиты от дублирования. |
+| **`BYPASS_TOO_LARGE`** | Размер входящего запроса или исходящего ответа превысил лимиты. | Кэширование отменяется для защиты RAM/CPU, но бизнес-логика выполняется штатно. |
 
 ---
 
@@ -106,44 +111,51 @@ func main() {
 groups:
   - name: idempotency_infra_alerts
     rules:
-      # 1. ALERT: Авария распределенного хранилища (Размыкание Circuit Breaker)
+      # 1. ALERT: Авария хранилища идемпотентности (Размыкание Circuit Breaker)
       - alert: IdempotencyCircuitBreakerOpen
-        expr: sum(rate(idempotency_requests_total{status="BYPASS_FAIL_OPEN"}[2m])) > 5
+        expr: sum(rate(idempotency_requests_total{status=~"BYPASS_FAIL_OPEN|FAIL_CLOSED"}[2m])) > 5
         for: 1m
         labels:
           severity: critical
           tier: platform
         annotations:
-          summary: "Предохранитель слоя идемпотентности РАЗОМКНУТ (Redis недоступен)"
-          description: "За последние 2 минуты зафиксировано лавинообразное количество ошибок взаимодействия с Redis. Слой идемпотентности аварийно отключен (Fail-Open), транзакции идут напрямую в базу без проверки дубликатов. Риск двойных списаний денежных средств!"
+          summary: "Предохранитель слоя идемпотентности РАЗОМКНУТ (хранилище недоступно)"
+          description: "За последние 2 минуты зафиксирован всплеск ошибок хранилища идемпотентности. В режиме Fail-Open запросы идут в бизнес-логику без дедупликации (риск дублей), в режиме Fail-Closed клиенты получают 503 Service Unavailable."
 
-      # 2. ALERT: Высокий уровень конфликтов данных payload (Попытка фрода или баг фронтенда)
+      # 2. ALERT: Высокий уровень конфликтов данных payload (Попытка фрода или баг клиента)
       - alert: IdempotencyHighConflictRate
-        expr: sum(rate(idempotency_requests_total{status="CONFLICT"}[5m])) > 20
+        expr: sum(increase(idempotency_requests_total{status="CONFLICT"}[5m])) > 20
         for: 3m
         labels:
           severity: warning
           tier: application
         annotations:
-          summary: "Обнаружен высокий уровень бизнес-конфликтов payload"
-          description: "Зафиксировано более 20 конфликтов за последние 5 минут. Клиенты отправляют одинаковые Idempotency-Key с разными телами запроса. Возможна интеграционная ошибка на стороне фронтенда или попытка мошеннического подбора ключей."
+          summary: "Обнаружен высокий уровень бизнес-конфликтов payload (422 Unprocessable Entity)"
+          description: "Зафиксировано более 20 конфликтов за последние 5 минут. Клиенты отправляют одинаковые Idempotency-Key с разными телами запроса. Возможна ошибка интеграции на стороне клиента или попытка подбора ключей."
 ```
+
 
 ---
 
 ## 📝 OpenAPI / Swagger Аннотации
 
-Чтобы спецификация вашего API автоматически генерировала корректную документацию заголовков для сторонних интеграторов, используйте следующие Swaggo-декораторы над вашими хэндлерами:
+Чтобы спецификация вашего API автоматически генерировала корректную документацию заголовков и кодов ответов для сторонних интеграторов, используйте следующие Swaggo-декораторы над вашими хэндлерами:
 
 ```go
 // ChargePaymentHandler обрабатывает списание денежных средств
 // @Summary      Атомарное списание средств
-// @Param        Idempotency-Key  header    string  true  "Уникальный UUID операции для дедупликации"
+// @Param        Idempotency-Key  header    string  true  "Уникальный ключ операции (UUID) для дедупликации"
 // @Success      201              {object}  ResponseStructure
-// @Header       201              {string}  X-Idempotency-Status  "Результат обработки слоя дедупликации (HIT, MISS, CONFLICT)"
-// @Header       201              {string}  Original-Request-Date "Дата первоначальной обработки транзакции (только для статуса HIT)"
+// @Header       201              {string}  X-Idempotency-Status  "Результат обработки слоя дедупликации (MISS, HIT, BYPASS_FAIL_OPEN, BYPASS_TOO_LARGE)"
+// @Header       201              {string}  Original-Request-Date "Дата и время первоначальной обработки транзакции в формате RFC 7231 (только при HIT)"
+// @Failure      400              {string}  string                "Отсутствует обязательный заголовок Idempotency-Key"
+// @Failure      422              {string}  string                "Конфликт payload: повторный запрос с тем же ключом, но другим телом (CONFLICT)"
+// @Failure      425              {string}  string                "Предыдущий запрос с тем же ключом еще выполняется (PROCESSING)"
+// @Header       425              {string}  Retry-After           "Рекомендуемое время ожидания в секундах перед повторным запросом"
+// @Failure      503              {string}  string                "Хранилище идемпотентности недоступно при активной стратегии FailClosed (FAIL_CLOSED)"
 // @Router       /api/v3/charge [post]
 ```
+
 
 ---
 
